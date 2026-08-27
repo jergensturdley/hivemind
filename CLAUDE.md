@@ -53,7 +53,7 @@ Coding-agent bridges live in `src/lib/harnesses.ts` (Claude Code, Grok, Cursor, 
 
 ## Roadmap
 
-`ROADMAP.md` tracks the plan to replace all remaining scripted simulation output with real, honestly labeled output (live planning/construction/review/QA, export, hardening). Check it before adding stage-machine behavior.
+`ROADMAP.md` tracks forward plans. The engine is live-only: there is no simulation fallback — failed or missing live calls halt the mission with the real error and point at the swarm-cli `doctor` command. Check it before adding stage-machine behavior.
 
 ## Conventions
 

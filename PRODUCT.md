@@ -39,7 +39,7 @@ Confirmed:
 
 - BYOK chat (OpenAI-compatible and Anthropic messages) plus first-class providers; xAI device-code OAuth, OpenRouter PKCE, and Codex (ChatGPT) device login where wired.
 - Per-agent route: each roster role can use a different saved key and model. Empty route uses the default key.
-- Simulation engine runs when no key+model is selected; live mode only after a model is chosen.
+- Live models only — there is no simulation engine. Without a key+model the swarm cannot run; failed calls halt the mission with the real error and point at the `doctor` command, which diagnoses and fixes keys.
 - Atlas harness routing is dispatch-and-return, not spawning those CLIs from Next as a first-class process.
 - Artifacts live in the workbench: spec, architecture/tasks, generated files, review.
 - A mission can start from a pasted spec or from an imported local folder (files land in the workbench; init runs the swarm against that tree).
