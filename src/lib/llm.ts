@@ -53,12 +53,7 @@ export async function* streamChat(
  * completions — translate the call and parse its SSE events
  * (response.output_text.delta carries the visible tokens).
  */
-function postCodexResponses(
-  cfg: LlmConfig,
-  model: string,
-  msgs: ChatMsg[],
-  maxTokens: number
-): Promise<Response> {
+function postCodexResponses(cfg: LlmConfig, model: string, msgs: ChatMsg[]): Promise<Response> {
   const system = msgs.filter((m) => m.role === "system").map((m) => m.content).join("\n\n");
   return fetch(`${baseFor(cfg)}/responses`, {
     method: "POST",
@@ -71,6 +66,11 @@ function postCodexResponses(
     },
     body: JSON.stringify({
       model,
+      // ChatGPT-plan tokens refuse server-side response storage; the backend
+      // 400s ("Store must be set to false") without it. It also rejects
+      // max_output_tokens outright, so no token cap is sent — the stream is
+      // bounded client-side instead.
+      store: false,
       ...(system ? { instructions: system } : {}),
       input: msgs
         .filter((m) => m.role !== "system")
@@ -79,7 +79,6 @@ function postCodexResponses(
           content: [{ type: m.role === "assistant" ? "output_text" : "input_text", text: m.content }],
         })),
       stream: true,
-      max_output_tokens: maxTokens,
     }),
     signal: AbortSignal.timeout(120_000),
   });
@@ -101,7 +100,7 @@ async function* streamCodexResponses(
   let res: Response | undefined;
   let errText = "";
   for (const candidate of codexModelLadder(cfg.model)) {
-    res = await postCodexResponses(cfg, candidate, msgs, maxTokens);
+    res = await postCodexResponses(cfg, candidate, msgs);
     if (res.ok) {
       if (candidate !== cfg.model) console.warn(`codex: "${cfg.model}" rejected — using "${candidate}"`);
       break;
