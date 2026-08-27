@@ -5,7 +5,7 @@ import { useFocusTrap } from "@/components/useFocusTrap";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { STAGES, stageIndex } from "@/lib/agents";
-import { isHarnessId, type HarnessId } from "@/lib/harnesses";
+import { customHarnessesOf, isKnownHarnessId } from "@/lib/harnesses";
 import {
   folderNameFromPaths,
   inferSpecFromFiles,
@@ -79,7 +79,7 @@ export function StudioClient({ user }: { user: { id: number; name: string; email
   const [modal, setModal] = useState(false);
   const [name, setName] = useState("");
   const [spec, setSpec] = useState("");
-  const [cliAgent, setCliAgent] = useState<HarnessId>("hive");
+  const [cliAgent, setCliAgent] = useState<string>("hive");
   const [creating, setCreating] = useState(false);
   const [confirmId, setConfirmId] = useState<number | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -134,7 +134,7 @@ export function StudioClient({ user }: { user: { id: number; name: string; email
       .then((r) => (r.ok ? (r.json() as Promise<{ data: { cliAgent?: string } }>) : null))
       .then((data) => {
         const id = data?.data?.cliAgent;
-        if (id && isHarnessId(id)) setCliAgent(id);
+        if (id && isKnownHarnessId(id, customHarnessesOf(data?.data))) setCliAgent(id);
       })
       .catch(() => {
         /* keep hive */

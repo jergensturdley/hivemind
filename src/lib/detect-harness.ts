@@ -39,3 +39,13 @@ export async function detectHarnesses(): Promise<HarnessStatus[]> {
     })
   );
 }
+
+/** Presets plus the user's custom bridges, all probed. */
+export async function detectAll(customs: HarnessDef[] = []): Promise<HarnessStatus[]> {
+  return Promise.all(
+    [...HARNESSES, ...customs].map(async (h) => {
+      const d = await detectHarness(h);
+      return { ...h, ...d };
+    })
+  );
+}

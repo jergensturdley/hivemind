@@ -25,6 +25,7 @@ export function WorkspaceClient({ projectId, user, autoRun }: { projectId: numbe
   const [termOpen, setTermOpen] = useState(false);
   const [wide, setWide] = useState(false);
   const [routes, setRoutes] = useState<Record<string, string>>({});
+  const [harnessNames, setHarnessNames] = useState<Record<string, string>>({});
   const feedRef = useRef<HTMLDivElement>(null);
   const sheetRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
@@ -69,6 +70,16 @@ export function WorkspaceClient({ projectId, user, autoRun }: { projectId: numbe
         /* roster hints are optional */
       }
     })();
+    void fetch("/api/harnesses")
+      .then((r) => (r.ok ? (r.json() as Promise<{ harnesses: { id: string; name: string }[] }>) : null))
+      .then((data) => {
+        const map: Record<string, string> = {};
+        for (const h of data?.harnesses ?? []) map[h.id] = h.name;
+        setHarnessNames(map);
+      })
+      .catch(() => {
+        /* presets resolve anyway */
+      });
   }, []);
 
   const doneCount = tasks.filter((t) => t.status === "done").length;
@@ -250,7 +261,7 @@ export function WorkspaceClient({ projectId, user, autoRun }: { projectId: numbe
             >
               hub: <b className="font-mono text-mut">Hivemind</b>
               <span className="text-dim">·</span>
-              prefer: <b className="font-mono text-mut">{cliAgentById(project.cliAgent).name}</b>
+              prefer: <b className="font-mono text-mut">{harnessNames[project.cliAgent] ?? cliAgentById(project.cliAgent).name}</b>
             </span>
           </div>
 

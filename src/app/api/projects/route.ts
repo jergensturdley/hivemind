@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
 import { db } from "@/db";
-import { projects, messages, tasks, artifacts, apiKeys } from "@/db/schema";
+import { projects, messages, tasks, artifacts, apiKeys, userSettings } from "@/db/schema";
 import { and, count, desc, eq, inArray, ne } from "drizzle-orm";
 import { getSessionUser } from "@/lib/session";
-import { harnessById } from "@/lib/harnesses";
+import { customHarnessesOf, isKnownHarnessId } from "@/lib/harnesses";
 import { sanitizeImportFiles, type ImportFile } from "@/lib/import-folder";
 
 export const runtime = "nodejs";
@@ -76,6 +76,10 @@ export async function POST(req: Request) {
   const name = String(body?.name ?? "").trim() || spec.split(/\s+/).slice(0, 3).join(" ");
   const incoming = Array.isArray(body?.files) ? (body.files as ImportFile[]) : [];
   const { files } = sanitizeImportFiles(incoming);
+  const [settingsRow] = await db.select().from(userSettings).where(eq(userSettings.userId, user.id)).limit(1);
+  const customs = customHarnessesOf(settingsRow?.data);
+  const wanted = String(body?.cliAgent ?? "hive");
+  const cliAgent = isKnownHarnessId(wanted, customs) ? wanted : "hive";
   const row = await db.transaction(async (tx) => {
     const [created] = await tx
       .insert(projects)
@@ -84,7 +88,7 @@ export async function POST(req: Request) {
         name: name.slice(0, 60),
         spec,
         stage: "intake",
-        cliAgent: harnessById(String(body?.cliAgent ?? "hive")).id,
+        cliAgent,
         ctx: files.length ? { imported: true, importedFiles: files.map((f) => f.path) } : {},
       })
       .returning();

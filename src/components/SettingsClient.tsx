@@ -3,7 +3,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { AGENTS } from "@/lib/agents";
 import { PROVIDERS, providerById } from "@/lib/providers";
-import type { HarnessId } from "@/lib/harnesses";
+import {
+  customHarnessDef,
+  type CustomHarnessInput,
+} from "@/lib/harnesses";
 import { Avatar, Spinner, cls } from "@/components/ui";
 import { Shell } from "@/components/Shell";
 import { HarnessGrid } from "@/components/HarnessGrid";
@@ -24,6 +27,7 @@ type AgentRoute = { keyId?: number; model?: string };
 type SettingsData = {
   cliAgent?: string;
   agents?: Record<string, AgentRoute>;
+  customHarnesses?: CustomHarnessInput[];
 };
 
 type ModelInfo = { id: string; name: string };
@@ -64,6 +68,11 @@ export function SettingsClient({ user }: { user: { id: number; name: string; ema
     device_code: string;
     interval: number;
   } | null>(null);
+
+  // custom bridge form
+  const [chName, setChName] = useState("");
+  const [chBin, setChBin] = useState("");
+  const [chTemplate, setChTemplate] = useState("");
 
   const loadCatalog = useCallback(async (id: number) => {
     try {
@@ -599,12 +608,81 @@ export function SettingsClient({ user }: { user: { id: number; name: string; ema
               <HarnessGrid
                 layout="list"
                 value={settings.cliAgent ?? "hive"}
-                onChange={(id: HarnessId) => {
+                onChange={(id: string) => {
                   void saveSettings({ cliAgent: id });
                   flash(`Bridge set to ${id}`);
                 }}
               />
             </div>
+          </section>
+
+          {/* Custom bridges */}
+          <section className={`${cls.card} p-5`}>
+            <h2 className="font-display text-[16px] font-bold text-ink">Custom bridges</h2>
+            <p className="mt-1 text-[12.5px] text-mut">
+              Add a coding agent that isn&apos;t in the preset list. Set the binary name so Hivemind can probe
+              PATH and tell you whether it&apos;s installed; the command template is what gets printed for you to run.
+            </p>
+            {(settings.customHarnesses ?? []).length > 0 && (
+              <div className="mt-3 space-y-2">
+                {(settings.customHarnesses ?? []).map((c, i) => {
+                  const def = customHarnessDef(c);
+                  return (
+                    <div key={def.id || i} className="flex items-center gap-3 rounded-lg border border-line bg-bg2 p-3">
+                      <span className="min-w-0 flex-1">
+                        <span className="flex items-center gap-2">
+                          <span className="text-[13px] font-bold text-ink">{def.name}</span>
+                          <span className="font-mono text-[10px] text-dim">{def.id}</span>
+                        </span>
+                        <span className="mt-0.5 block truncate font-mono text-[10.5px] text-dim">$ {def.template}</span>
+                      </span>
+                      <button
+                        type="button"
+                        className={`${cls.btn} shrink-0`}
+                        onClick={() => {
+                          const next = (settings.customHarnesses ?? []).filter((_, j) => j !== i);
+                          void saveSettings({ customHarnesses: next });
+                          flash(`Removed ${def.name}`);
+                        }}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            <div className="mt-3 grid gap-2 sm:grid-cols-[1fr_1fr]">
+              <input className={cls.input} placeholder="Bridge name (e.g. Trae)" value={chName} onChange={(e) => setChName(e.target.value)} />
+              <input className={cls.input} placeholder="Binary on PATH (optional, e.g. trae)" value={chBin} onChange={(e) => setChBin(e.target.value)} />
+              <input
+                className={`${cls.input} sm:col-span-2`}
+                placeholder='Command template (optional, use {task} — e.g. trae "run {task}")'
+                value={chTemplate}
+                onChange={(e) => setChTemplate(e.target.value)}
+              />
+            </div>
+            <button
+              type="button"
+              className={`${cls.btnPrimary} mt-2`}
+              disabled={!chName.trim()}
+              onClick={() => {
+                const def = customHarnessDef({ name: chName, bin: chBin, template: chTemplate });
+                const exists = (settings.customHarnesses ?? []).some((c) => customHarnessDef(c).id === def.id);
+                if (exists) {
+                  flash(`A bridge named ${def.name} already exists`);
+                  return;
+                }
+                const next = [...(settings.customHarnesses ?? []), { id: def.id, name: chName.trim(), bin: chBin.trim(), template: chTemplate.trim() }];
+                void saveSettings({ customHarnesses: next });
+                setChName("");
+                setChBin("");
+                setChTemplate("");
+                flash(`Added custom bridge ${def.name}`);
+              }}
+            >
+              + Add custom bridge
+            </button>
           </section>
 
           {/* Agent overrides */}

@@ -12,6 +12,8 @@ import { cfgFromKey } from "@/lib/key-auth";
 import { pingModel } from "@/lib/llm";
 import { AGENTS } from "@/lib/agents";
 import { providerById } from "@/lib/providers";
+import { customHarnessesOf } from "@/lib/harnesses";
+import { detectAll } from "@/lib/detect-harness";
 import type { TermLine } from "@/lib/events";
 
 const RETIRED_CODEX = new Set(["gpt-5.1-codex", "gpt-5-codex", "gpt-5.3-codex"]);
@@ -89,6 +91,19 @@ export async function runDoctor(userId: number): Promise<TermLine[]> {
       const model = route?.model?.trim() || key.model;
       say(`  ${a.glyph} ${a.name.padEnd(8)} → ${key.label} · ${model}`, "dim");
     }
+  }
+
+  // Pass 4 — harness bridges: which coding CLIs are actually on PATH here.
+  const [settingsForHarness] = await db.select().from(userSettings).where(eq(userSettings.userId, userId)).limit(1);
+  const harnesses = await detectAll(customHarnessesOf(settingsForHarness?.data));
+  say("coding-agent bridges on this machine", "ok");
+  for (const h of harnesses) {
+    const state = h.bin
+      ? h.installed
+        ? `✓ on PATH (${h.binPath})`
+        : "◌ off PATH — routing label only"
+      : "✓ native";
+    say(`  ${h.glyph} ${h.name.padEnd(14)} ${state}${h.custom ? "  · custom" : ""}`, h.installed || !h.bin ? "dim" : "warn");
   }
 
   say(

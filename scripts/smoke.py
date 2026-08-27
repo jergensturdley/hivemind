@@ -526,6 +526,37 @@ if bad_key_id:
 if mock_key_id:
     req("PATCH", "/api/keys", {"id": mock_key_id, "isDefault": True})  # the unreachable key stole the default flag
 
+# ---- custom bridges: add, probe, switch, doctor recognizes --------------
+status, _, data = req("GET", "/api/settings")
+settings_before = json.loads(data).get("data", {})
+with_bridge = list(settings_before.get("customHarnesses", [])) + [
+    {"name": "Smoke Bridge", "bin": "smoke-bridge-nope", "template": 'smoke-bridge-nope "{task}"'}
+]
+status, _, data = req("POST", "/api/settings", {"customHarnesses": with_bridge})
+check("custom bridge saved to settings", status == 200)
+status, _, data = req("GET", "/api/harnesses")
+hrows = json.loads(data).get("harnesses", [])
+sbridge = next((h for h in hrows if h.get("name") == "Smoke Bridge"), None)
+check(
+    "custom bridge listed with a PATH probe",
+    sbridge is not None and sbridge.get("custom") is True and sbridge.get("installed") is False,
+    str(sbridge),
+)
+status, _, data = req("POST", f"/api/projects/{pid4}/cli", {"command": "harness use c-smoke-bridge"})
+check(
+    "harness use accepts the custom id",
+    any("bridge switched" in l.get("text", "") for l in json.loads(data).get("lines", [])),
+    str(json.loads(data).get("lines")),
+)
+status, _, data = req("POST", f"/api/projects/{pid4}/cli", {"command": "doctor"})
+doc_lines = [l.get("text", "") for l in json.loads(data).get("lines", [])]
+check(
+    "doctor reports the custom bridge off PATH",
+    any("Smoke Bridge" in t and "off PATH" in t for t in doc_lines),
+    str([t for t in doc_lines if "Smoke" in t]),
+)
+req("POST", "/api/settings", {"customHarnesses": settings_before.get("customHarnesses", [])})  # restore
+
 # ---- mission 5: `cli hive "task"` queues real work ---------------------
 status, _, data = req(
     "POST", "/api/projects", {"name": "Cli Queue", "spec": 'Build "Cli Queue" — a reading queue with shareable lists.'}

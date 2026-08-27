@@ -18,6 +18,8 @@ import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import { agentById, cliAgentById, renderHarnessCmd } from "@/lib/agents";
 import { cfgFromKey } from "@/lib/key-auth";
 import { HOME_HARNESS, routeTasks, staysHome } from "@/lib/harness-route";
+import { customHarnessesOf, resolveHarnessDef, type HarnessDef } from "@/lib/harnesses";
+import { detectHarness } from "@/lib/detect-harness";
 import { genHarnessPack, harnessPackSummary } from "@/lib/harness-pack";
 import { streamChat, type ChatMsg, type LlmConfig } from "@/lib/llm";
 import { createThinkFilter, stripThink } from "@/lib/think";
@@ -122,12 +124,17 @@ async function taskList(projectId: number): Promise<WireTask[]> {
 
 type AgentRoute = { keyId?: number; model?: string };
 
-async function agentRoutes(userId: number): Promise<{ routes?: Record<string, AgentRoute>; error?: unknown }> {
+async function agentRoutes(
+  userId: number
+): Promise<{ routes?: Record<string, AgentRoute>; customs: HarnessDef[]; error?: unknown }> {
   try {
     const [s] = await db.select().from(userSettings).where(eq(userSettings.userId, userId)).limit(1);
-    return { routes: (s?.data as { agents?: Record<string, AgentRoute> } | null)?.agents };
+    return {
+      routes: (s?.data as { agents?: Record<string, AgentRoute> } | null)?.agents,
+      customs: customHarnessesOf(s?.data),
+    };
   } catch (e) {
-    return { error: e };
+    return { customs: [], error: e };
   }
 }
 
@@ -310,11 +317,17 @@ function parseTasks(text: string): { title: string; detail: string }[] | null {
   const start = text.indexOf("[");
   const end = text.lastIndexOf("]");
   if (start < 0 || end <= start) return null;
+  const slice = text.slice(start, end + 1);
   let raw: unknown;
   try {
-    raw = JSON.parse(text.slice(start, end + 1));
+    raw = JSON.parse(slice);
   } catch {
-    return null;
+    try {
+      // Models love trailing commas; JSON does not.
+      raw = JSON.parse(slice.replace(/,\s*([}\]])/g, "$1"));
+    } catch {
+      return null;
+    }
   }
   if (!Array.isArray(raw)) return null;
   const parsed = raw
@@ -331,9 +344,9 @@ function parseTasks(text: string): { title: string; detail: string }[] | null {
 }
 
 /**
- * Derive the build task list. Live mode asks Vector to extract real tasks from
- * the spec + architecture (+ the imported tree, which is already in the turn
- * context); sim mode and failed parses fall back to the template plan.
+ * Derive the build task list: Vector extracts real tasks from the spec +
+ * architecture (+ the imported tree, already in the turn context). One retry
+ * with a format reminder before giving up.
  */
 async function planTasksFor(
   p: ProjectRow,
@@ -343,22 +356,28 @@ async function planTasksFor(
 ): Promise<{ tasks: { title: string; detail: string }[] } | { failed: string }> {
   const imported = importedPathsOf(p).size > 0;
   const arch = archDoc.length > 2400 ? `${archDoc.slice(0, 2400)}\n…(truncated)` : archDoc;
-  const r = await speak(
-    spokenTurn(p, "vector", {
-      instruction:
-        (imported
-          ? "Derive the implementation task list for EXTENDING the existing imported codebase above. Every task must modify or add to what already exists — never scaffold a fresh app over it."
-          : "Derive the implementation task list from the spec and the architecture document below.") +
-        `\n\nArchitecture document:\n${arch}\n\nRespond with ONLY a JSON array of 4-8 objects: [{"title": "...", "detail": "..."}]. Titles are short imperative work items; details are one sentence naming the files or surfaces involved. No prose, no code fences.`,
-      maxTokens: 900,
-      silent: true,
-    }),
-    emit
-  );
-  if (r.failed) return { failed: r.failed };
-  const parsed = parseTasks(r.content);
-  if (parsed) return { tasks: parsed };
-  return { failed: "task extraction returned no usable JSON task list" };
+  const instruction =
+    (imported
+      ? "Derive the implementation task list for EXTENDING the existing imported codebase above. Every task must modify or add to what already exists — never scaffold a fresh app over it."
+      : "Derive the implementation task list from the spec and the architecture document below.") +
+    `\n\nArchitecture document:\n${arch}\n\nRespond with ONLY a JSON array of 4-8 objects: [{"title": "...", "detail": "..."}]. Titles are short imperative work items; details are one sentence naming the files or surfaces involved. No prose, no code fences.`;
+  const run = (extra: string) =>
+    speak(
+      spokenTurn(p, "vector", { instruction: instruction + extra, maxTokens: 2000, silent: true }),
+      emit
+    );
+  let r = await run("");
+  if (!r.failed) {
+    const parsed = parseTasks(r.content);
+    if (parsed) return { tasks: parsed };
+    r = await run("\n\nREMINDER: respond with ONLY the raw JSON array — no prose, no code fences, no trailing commas.");
+    if (!r.failed) {
+      const retry = parseTasks(r.content);
+      if (retry) return { tasks: retry };
+      return { failed: "task extraction returned no usable JSON task list after one retry" };
+    }
+  }
+  return { failed: r.failed };
 }
 
 /* ---------------- live construction (Phase 2) ---------------- */
@@ -404,6 +423,15 @@ function parseGeneratedFiles(text: string): { files: GeneratedFile[]; summary: s
     const content = m[2].trimEnd();
     if (path && !isJunkOutPath(path) && content.trim().length > 20) files.push({ path, content: `${content}\n` });
   }
+  // Budget-truncated output can leave the last fence unclosed; salvage it.
+  if (!files.length) {
+    const open = text.match(/FILE:\s*`?([^\n`]+?)`?\s*\n+```[a-zA-Z0-9]*\r?\n([\s\S]+)$/);
+    if (open) {
+      const path = safeOutPath(open[1]);
+      const content = open[2].trimEnd();
+      if (path && !isJunkOutPath(path) && content.trim().length > 20) files.push({ path, content: `${content}\n` });
+    }
+  }
   if (!files.length) return null;
   const sum = text.match(/SUMMARY:\s*(.+)/i);
   return { files, summary: sum ? sum[1].trim().slice(0, 200) : "" };
@@ -426,9 +454,13 @@ async function priorFilesDigest(p: ProjectRow): Promise<string> {
   if (!list.length) return "";
   return list
     .map(([path, content]) => {
+      // Reviewers must see the whole file or they flag "missing" code that
+      // exists past the excerpt; truncate only what truly won't fit.
       const body =
-        content.length > 24_000 ? "(large file — omitted)" : content.slice(0, 1000);
-      return `- ${path}\n\`\`\`\n${body}${content.length > 1000 && content.length <= 24_000 ? "\n…(truncated)" : ""}\n\`\`\``;
+        content.length <= 16_000
+          ? content
+          : `${content.slice(0, 2000)}\n…(middle truncated — ${content.length - 3000} chars)…\n${content.slice(-1000)}`;
+      return `- ${path}\n\`\`\`\n${body}\n\`\`\``;
     })
     .join("\n");
 }
@@ -463,7 +495,7 @@ async function forgeTurn(
     "SUMMARY: <one sentence on what you built>";
   const run = (extra: string) =>
     speak(
-      spokenTurn(p, "forge", { instruction: instruction + extra, maxTokens: 2400, silent: true }),
+      spokenTurn(p, "forge", { instruction: instruction + extra, maxTokens: 8000, silent: true }),
       emit
     );
   let r = await run("");
@@ -474,7 +506,8 @@ async function forgeTurn(
     if (!r.failed) {
       const retry = parseGeneratedFiles(r.content);
       if (retry) return retry;
-      return { failed: "generation returned no usable FILE block after one retry" };
+      const glimpse = r.content.replace(/\s+/g, " ").trim().slice(0, 140);
+      return { failed: `generation returned no usable FILE block after one retry — model replied: "${glimpse}…"` };
     }
   }
   return { failed: r.failed };
@@ -544,9 +577,9 @@ async function fixTurn(
       instruction:
         `A code review flagged \`${path}\`. Apply the findings to it and return the COMPLETE updated file.\n\n` +
         `Review findings:\n${reviewDoc.slice(0, 1500)}\n\n` +
-        `Current ${path}:\n\`\`\`\n${cur.content.slice(0, 4000)}\n\`\`\`\n\n` +
+        `Current ${path}:\n\`\`\`\n${cur.content.slice(0, 8000)}\n\`\`\`\n\n` +
         `Output EXACTLY one file:\nFILE: ${path}\n\`\`\`<language>\n<complete updated content>\n\`\`\``,
-      maxTokens: 2400,
+      maxTokens: 8000,
       silent: true,
     }),
     emit
@@ -654,7 +687,7 @@ async function* handleInterrupt(p: ProjectRow, emit: (ev: SwarmEvent) => void): 
     const rev = await speak(
       spokenTurn(p, "nova", {
         instruction: `Rewrite the product spec as v2 absorbing the commander's revision notes below. Keep the same structure (vision, problem, capability table, primary journey, non-goals, success metrics). Output complete markdown only.\n\nRevision notes: ${text}\n\nCurrent spec:\n${(await latestSpecOf(p.id)) ?? ""}`,
-        maxTokens: 1500,
+        maxTokens: 3000,
         silent: true,
       }),
       emit
@@ -694,7 +727,7 @@ async function* handleInterrupt(p: ProjectRow, emit: (ev: SwarmEvent) => void): 
 async function* speakInterrupt(p: ProjectRow, agent: string, text: string): AsyncGenerator<SwarmEvent, SpokenResult> {
   const gen = spokenTurn(p, agent, {
     instruction: `The human commander just said: "${text}". Respond in character in 2-3 sentences, acknowledging and stating what you'll adjust.`,
-    maxTokens: 220,
+    maxTokens: 800,
   });
   yield { type: "turn_start", agent };
   let result: SpokenResult = { content: "", failed: "interrupt reply never ran" };
@@ -780,7 +813,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
       };
       const ack = await speak(spokenTurn(p, "nova", {
         instruction: `Acknowledge the mission brief in 2-3 sentences. Mention that you extracted ${ctx.features.length} capabilities and are drafting the spec. Be warm and crisp.`,
-        maxTokens: 200,
+        maxTokens: 800,
       }), emit);
       if (ack.failed) {
         yield* llmHalt(p, "nova", ack.failed);
@@ -795,7 +828,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
     case "spec": {
       const doc = await speak(spokenTurn(p, "nova", {
         instruction: "Write the complete v1 product spec as structured markdown (vision, problem, capability table, primary journey, non-goals, success metrics). Output markdown only.",
-        maxTokens: 1500,
+        maxTokens: 3000,
       }), emit);
       if (doc.failed) {
         yield* llmHalt(p, "nova", doc.failed);
@@ -817,7 +850,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
     case "plan": {
       const doc = await speak(spokenTurn(p, "vector", {
         instruction: "Write the architecture document as markdown: stack table with rationale, a small ASCII system diagram, core data model, file tree, and invariants. Output markdown only.",
-        maxTokens: 1500,
+        maxTokens: 3000,
       }), emit);
       if (doc.failed) {
         yield* llmHalt(p, "vector", doc.failed);
@@ -832,7 +865,8 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
         yield* llmHalt(p, "vector", plan.failed);
         return;
       }
-      const routed = routeTasks(plan.tasks.map((t) => t.title), p.cliAgent);
+      const { customs: planCustoms } = await agentRoutes(p.userId);
+      const routed = routeTasks(plan.tasks.map((t) => t.title), p.cliAgent, planCustoms);
       let i = 0;
       for (const t of plan.tasks) {
         await db.insert(tasks).values({
@@ -873,7 +907,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
     case "critique": {
       const c1 = await speak(spokenTurn(p, "sentinel", {
         instruction: `Raise two concrete design-review concerns about this plan (input validation + rate limiting, and unbounded table growth). Write them as short punchy chat messages, not a document. Start with "Two things before we approve."`,
-        maxTokens: 300,
+        maxTokens: 1000,
       }), emit);
       if (c1.failed) {
         yield* llmHalt(p, "sentinel", c1.failed);
@@ -884,7 +918,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
 
       const reply = await speak(spokenTurn(p, "vector", {
         instruction: "Concede both review concerns and state exactly how the plan absorbs them (guards module + pagination + index). Two sentences.",
-        maxTokens: 220,
+        maxTokens: 800,
       }), emit);
       if (reply.failed) {
         yield* llmHalt(p, "vector", reply.failed);
@@ -895,7 +929,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
 
       const novaLine = await speak(spokenTurn(p, "nova", {
         instruction: "As PM, confirm the spec absorbs the review concerns and announce spec v2. Two sentences.",
-        maxTokens: 180,
+        maxTokens: 800,
       }), emit);
       if (novaLine.failed) {
         yield* llmHalt(p, "nova", novaLine.failed);
@@ -904,7 +938,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
       const v = 2;
       const v2 = await speak(spokenTurn(p, "nova", {
         instruction: "Rewrite the product spec as v2 absorbing the critique: harden input validation, rate-limit mutations, paginate + index the events table. Keep the same structure; output complete markdown only.",
-        maxTokens: 1500,
+        maxTokens: 3000,
         silent: true,
       }), emit);
       if (v2.failed) {
@@ -949,8 +983,16 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
       await db.update(tasks).set({ status: "building" }).where(eq(tasks.id, next.id));
       yield { type: "tasks", tasks: await taskList(p.id) };
 
-      const dest = cliAgentById(next.harness || p.cliAgent);
+      const { customs: buildCustoms } = await agentRoutes(p.userId);
+      const dest = resolveHarnessDef(next.harness || p.cliAgent, buildCustoms);
       const home = dest.id === HOME_HARNESS;
+      // Recognize availability: a routed bridge is a label unless its CLI is on PATH.
+      const avail = home ? null : await detectHarness(dest);
+      const availNote = home
+        ? ""
+        : avail?.installed
+          ? ` The ${dest.name} CLI is on PATH at \`${avail.binPath}\` — the command below is runnable, but Hivemind still does not spawn it.`
+          : ` ${dest.name} is not on PATH on this machine, so this is a routing label only.`;
       yield {
         type: "message",
         msg: await persistMsg(
@@ -959,14 +1001,21 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
           "chat",
           home
             ? `Keeping **task ${idx + 1}/${all.length}: ${next.title}** on Hivemind. Forge writes it here — no outbound dispatch.`
-            : `Routing **task ${idx + 1}/${all.length}: ${next.title}** via the **${dest.name}** bridge — a routing label; nothing is spawned. Forge generates natively and the output lands back in this room.`
+            : `Routing **task ${idx + 1}/${all.length}: ${next.title}** via the **${dest.name}** bridge.${availNote} Forge generates natively and the output lands back in this room.`
         ),
       };
       yield {
         type: "term",
         lines: [
           { text: `$ ${renderHarnessCmd(dest, next.title).replace(/"/g, "'")}`, tone: "cmd" },
-          { text: home ? "… native write in the Hivemind workspace" : `… routed via ${dest.name} bridge · generation stays in Hivemind`, tone: "dim" },
+          {
+            text: home
+              ? "… native write in the Hivemind workspace"
+              : avail?.installed
+                ? `… routed via ${dest.name} bridge · CLI on PATH · generation stays in Hivemind`
+                : `… routed via ${dest.name} bridge · off PATH (label only) · generation stays in Hivemind`,
+            tone: avail?.installed ? "ok" : "warn",
+          },
         ],
       };
       await sleep(pacing() + 400);
@@ -990,7 +1039,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
         if (kept.length) {
           const keepNote = await speak(spokenTurn(p, "forge", {
             instruction: `Task "${next.title}" maps to ${kept.map((k) => k.path).join(", ")}, which already exists in the imported codebase. Confirm in 1-2 sentences that you read the existing file and kept it rather than rewriting it. No code blocks.`,
-            maxTokens: 160,
+            maxTokens: 600,
           }), emit);
           if (!keepNote.failed) {
             yield { type: "message", msg: await persistSpoken(p, "forge", "chat", keepNote) };
@@ -1031,7 +1080,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
         }
         const note = await speak(spokenTurn(p, "forge", {
           instruction: `You just implemented task "${next.title}" producing ${fileList}. Report completion in 1-2 sentences${gen.summary ? ` mentioning: ${gen.summary}` : ""}. No code blocks.`,
-          maxTokens: 160,
+          maxTokens: 600,
         }), emit);
         // The files already landed; the note is flavor — skip it if the model can't speak.
         if (!note.failed) {
@@ -1056,7 +1105,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
         instruction:
           `Review the workspace files below for ${ctx.product} — a real code review: concrete findings with file references and severity (P0–P3), or genuine approval if the work holds up.\n\n${filesDigest}\n\n` +
           "End with EXACTLY one line:\nVERDICT: APPROVED\nor\nVERDICT: CHANGES: <comma-separated repo paths that need fixes>",
-        maxTokens: 1200,
+        maxTokens: 2000,
         silent: true,
       }), emit);
       if (review.failed) {
@@ -1146,7 +1195,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
       if (fixed.length) {
         const fixNote = await speak(spokenTurn(p, "forge", {
           instruction: `You applied review fixes to ${fixed.map((f) => `\`${f}\``).join(", ")}. Report in 1-2 sentences. No code blocks.`,
-          maxTokens: 140,
+          maxTokens: 600,
         }), emit);
         if (!fixNote.failed) {
           yield { type: "message", msg: await persistSpoken(p, "forge", "artifact", fixNote) };
@@ -1164,14 +1213,18 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
         for (const row of rows) {
           if (!row.path || seen.has(row.path)) continue;
           seen.add(row.path);
-          digest.push(`- ${row.path}\n\`\`\`\n${row.content.slice(0, 800)}\n\`\`\``);
+          const body =
+            row.content.length <= 16_000
+              ? row.content
+              : `${row.content.slice(0, 2000)}\n…(middle truncated)…\n${row.content.slice(-1000)}`;
+          digest.push(`- ${row.path}\n\`\`\`\n${body}\n\`\`\``);
         }
         yield { type: "turn_start", agent: "sentinel" };
         const re = await speak(spokenTurn(p, "sentinel", {
           instruction:
             `Re-read the fixed files below and judge only the fixes.\n\n${digest.join("\n")}\n\n` +
             "End with EXACTLY one line:\nVERDICT: APPROVED\nor\nVERDICT: CHANGES: <paths>",
-          maxTokens: 500,
+          maxTokens: 1200,
           silent: true,
         }), emit);
         if (re.failed) {
@@ -1214,7 +1267,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
       const checklist = await speak(spokenTurn(p, "probe", {
         instruction:
           `Produce the verification checklist for the shipped work as markdown. You performed STATIC review of the files only — the checklist must state clearly that nothing was executed. Group checks by capability with concrete file references.\n\n${await priorFilesDigest(p)}`,
-        maxTokens: 900,
+        maxTokens: 2000,
         silent: true,
       }), emit);
       if (checklist.failed) {
@@ -1234,7 +1287,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
       yield { type: "artifact", artifact: qArt };
       const qaNote = await speak(spokenTurn(p, "probe", {
         instruction: "You just published the verification checklist. Report in 2 sentences: you performed static review only and NOTHING was executed. Reference one concrete check. No code blocks.",
-        maxTokens: 140,
+        maxTokens: 600,
       }), emit);
       if (!qaNote.failed) {
         yield { type: "message", msg: await persistSpoken(p, "probe", "artifact", qaNote, { artifactId: qArt.id }) };
@@ -1280,7 +1333,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
           `Stats: ${fileRows.length} files, ${taskRows.length - failedTasks}/${taskRows.length} tasks completed${failedTasks ? `, ${failedTasks} failed` : ""}, ${msgCount} messages, ~${Math.max(1, Math.round(ms / 60000))} min.\n` +
           `Files: ${paths.join(", ") || "(none)"}\n\n` +
           `Sections: **What shipped** (derived from the file list), **How it was verified** (state plainly: static review only, nothing executed), **Next moves** (2-3 concrete options).`,
-        maxTokens: 900,
+        maxTokens: 2000,
         silent: true,
       }), emit);
       if (report.failed) {

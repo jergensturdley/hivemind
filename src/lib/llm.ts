@@ -80,7 +80,7 @@ function postCodexResponses(cfg: LlmConfig, model: string, msgs: ChatMsg[]): Pro
         })),
       stream: true,
     }),
-    signal: AbortSignal.timeout(120_000),
+    signal: AbortSignal.timeout(600_000),
   });
 }
 
@@ -166,7 +166,7 @@ async function* streamOpenAI(
       max_tokens: maxTokens,
       messages: msgs,
     }),
-    signal: AbortSignal.timeout(120_000),
+    signal: AbortSignal.timeout(600_000),
   });
   if (!res.ok || !res.body) {
     throw new Error(`LLM ${res.status}: ${(await res.text()).slice(0, 200)}`);
@@ -222,7 +222,7 @@ async function* streamAnthropic(
       system: system || undefined,
       messages: rest.length ? rest : [{ role: "user", content: "." }],
     }),
-    signal: AbortSignal.timeout(120_000),
+    signal: AbortSignal.timeout(600_000),
   });
   if (!res.ok || !res.body) {
     throw new Error(`LLM ${res.status}: ${(await res.text()).slice(0, 200)}`);

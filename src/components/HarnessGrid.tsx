@@ -1,21 +1,20 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { HARNESSES, type HarnessId } from "@/lib/harnesses";
+import { HARNESSES, type HarnessDef } from "@/lib/harnesses";
 import { Avatar, cls } from "@/components/ui";
 
-export type HarnessStatusLite = {
-  id: string;
+export type HarnessRow = HarnessDef & {
   installed: boolean;
   binPath: string | null;
 };
 
-function useHarnessStatus(): HarnessStatusLite[] | null {
-  const [rows, setRows] = useState<HarnessStatusLite[] | null>(null);
+function useHarnessRows(): HarnessRow[] | null {
+  const [rows, setRows] = useState<HarnessRow[] | null>(null);
   useEffect(() => {
     let alive = true;
     void fetch("/api/harnesses")
-      .then((r) => (r.ok ? (r.json() as Promise<{ harnesses: HarnessStatusLite[] }>) : null))
+      .then((r) => (r.ok ? (r.json() as Promise<{ harnesses: HarnessRow[] }>) : null))
       .then((data) => {
         if (alive && data?.harnesses) setRows(data.harnesses);
       })
@@ -29,12 +28,11 @@ function useHarnessStatus(): HarnessStatusLite[] | null {
   return rows;
 }
 
-function badge(id: string, statuses: HarnessStatusLite[] | null): { label: string; cls: string } {
-  if (id === "hive") return { label: "native", cls: "text-ok" };
-  const row = statuses?.find((s) => s.id === id);
-  if (!statuses) return { label: "bridge", cls: "text-dim" };
-  if (row?.installed) return { label: "on PATH", cls: "text-ok" };
-  return { label: "off PATH", cls: "text-dim" };
+function badge(row: HarnessRow | undefined): { label: string; cls: string } {
+  if (!row) return { label: "bridge", cls: "text-dim" };
+  if (!row.bin) return { label: row.id === "hive" ? "native" : "label only", cls: row.id === "hive" ? "text-ok" : "text-dim" };
+  if (row.installed) return { label: "on PATH", cls: "text-ok" };
+  return { label: "off PATH", cls: "text-warn" };
 }
 
 export function HarnessGrid({
@@ -43,17 +41,20 @@ export function HarnessGrid({
   layout = "grid",
 }: {
   value: string;
-  onChange: (id: HarnessId) => void;
+  onChange: (id: string) => void;
   layout?: "grid" | "list";
 }) {
-  const statuses = useHarnessStatus();
+  const live = useHarnessRows();
+  // Customs arrive with the live fetch; fall back to presets until then.
+  const items: HarnessRow[] =
+    live ?? HARNESSES.map((h) => ({ ...h, installed: !h.bin, binPath: null }));
 
   if (layout === "list") {
     return (
       <div className="space-y-2">
-        {HARNESSES.map((c) => {
+        {items.map((c) => {
           const active = value === c.id;
-          const b = badge(c.id, statuses);
+          const b = badge(c);
           return (
             <button
               key={c.id}
@@ -69,6 +70,7 @@ export function HarnessGrid({
                 <span className="flex items-center gap-2">
                   <span className="text-[13px] font-bold text-ink">{c.name}</span>
                   <span className={`text-[10px] font-bold uppercase tracking-wide ${b.cls}`}>{b.label}</span>
+                  {c.custom && <span className="text-[10px] font-bold uppercase tracking-wide text-dim">custom</span>}
                 </span>
                 <span className="block text-[11px] text-dim">{c.desc}</span>
                 <span className="mt-1 block truncate font-mono text-[10.5px] text-dim">$ {c.template}</span>
@@ -83,9 +85,9 @@ export function HarnessGrid({
 
   return (
     <div className="grid grid-cols-2 gap-2">
-      {HARNESSES.map((c) => {
+      {items.map((c) => {
         const active = value === c.id;
-        const b = badge(c.id, statuses);
+        const b = badge(c);
         return (
           <button
             key={c.id}
@@ -99,6 +101,7 @@ export function HarnessGrid({
             <div className="flex items-center gap-1.5">
               <Avatar hue={c.hue} glyph={c.glyph} size={20} />
               <span className="text-[12px] font-bold text-ink">{c.name}</span>
+              {c.custom && <span className="text-[9px] font-bold uppercase tracking-wide text-dim">custom</span>}
             </div>
             <div className={`mt-1 text-[10px] font-bold uppercase tracking-wide ${b.cls}`}>{b.label}</div>
             <div className="mt-0.5 line-clamp-2 text-[10.5px] leading-snug text-dim">{c.desc}</div>

@@ -1,10 +1,11 @@
 import { NextResponse } from "next/server";
 import { db } from "@/db";
-import { projects, messages, tasks, artifacts, apiKeys } from "@/db/schema";
+import { projects, messages, tasks, artifacts, apiKeys, userSettings } from "@/db/schema";
 import { asc, and, eq } from "drizzle-orm";
 import { getSessionUser } from "@/lib/session";
-import { AGENTS, HARNESSES, harnessById, isHarnessId, renderHarnessCmd } from "@/lib/agents";
-import { detectHarness, detectHarnesses } from "@/lib/detect-harness";
+import { AGENTS, renderHarnessCmd } from "@/lib/agents";
+import { HARNESSES, customHarnessesOf, isKnownHarnessId, resolveHarnessDef } from "@/lib/harnesses";
+import { detectAll, detectHarness } from "@/lib/detect-harness";
 import { HOME_HARNESS, routeTasks } from "@/lib/harness-route";
 import { runDoctor } from "@/lib/doctor";
 import type { TermLine } from "@/lib/events";
@@ -31,6 +32,8 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   const say = (text: string, tone?: TermLine["tone"]) => lines.push({ text, tone });
   let cliAgent = p.cliAgent;
   let wake = false;
+  const [settingsRow] = await db.select().from(userSettings).where(eq(userSettings.userId, user.id)).limit(1);
+  const customs = customHarnessesOf(settingsRow?.data);
 
   switch ((cmd ?? "").toLowerCase()) {
     case "help":
@@ -60,7 +63,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       const tks = await db.select().from(tasks).where(eq(tasks.projectId, pid));
       const done = tks.filter((t) => t.status === "done").length;
       const keys = await db.select({ id: apiKeys.id }).from(apiKeys).where(eq(apiKeys.userId, user.id)).limit(1);
-      const bridge = harnessById(p.cliAgent);
+      const bridge = resolveHarnessDef(p.cliAgent, customs);
       const det = await detectHarness(bridge);
       say(`mission     ${p.name}`, "ok");
       say(`stage       ${p.stage}${p.running ? "  (swarm active)" : ""}`);
@@ -87,11 +90,12 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       const sub = (rest[0] ?? "").toLowerCase();
       if (sub === "use" || sub === "set" || sub === "switch") {
         const nextId = (rest[1] ?? "").toLowerCase();
-        if (!isHarnessId(nextId)) {
-          say(`usage: harness use <${HARNESSES.map((h) => h.id).join("|")}>`, "err");
+        if (!isKnownHarnessId(nextId, customs)) {
+          const ids = [...HARNESSES, ...customs].map((h) => h.id).join("|");
+          say(`usage: harness use <${ids}>`, "err");
           break;
         }
-        const next = harnessById(nextId);
+        const next = resolveHarnessDef(nextId, customs);
         await db.update(projects).set({ cliAgent: next.id, updatedAt: new Date() }).where(eq(projects.id, pid));
         cliAgent = next.id;
         const det = await detectHarness(next);
@@ -114,7 +118,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
         });
         break;
       }
-      const rows = await detectHarnesses();
+      const rows = await detectAll(customs);
       say("coding-agent harnesses", "ok");
       for (const h of rows) {
         const mark = h.id === p.cliAgent ? "*" : " ";
@@ -146,18 +150,18 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     case "cli": {
       const agentId = (rest[0] ?? "").toLowerCase();
       const task = rest.slice(1).join(" ").replace(/^["']|["']$/g, "");
-      if (!isHarnessId(agentId) || !task) {
-        say(`usage: cli <${HARNESSES.map((c) => c.id).join("|")}> "task description"`, "err");
+      if (!isKnownHarnessId(agentId, customs) || !task) {
+        say(`usage: cli <${[...HARNESSES, ...customs].map((c) => c.id).join("|")}> "task description"`, "err");
         break;
       }
-      const agent = harnessById(agentId);
+      const agent = resolveHarnessDef(agentId, customs);
       const det = await detectHarness(agent);
       say(`$ ${renderHarnessCmd(agent, task)}`, "cmd");
       if (agent.id === "hive") {
         // The native bridge is in-product: queue the task on the board and wake the swarm.
         const existing = await db.select({ id: tasks.id, sort: tasks.sort }).from(tasks).where(eq(tasks.projectId, pid));
         const sort = existing.reduce((m, t) => Math.max(m, t.sort), -1) + 1;
-        const routed = routeTasks([task], p.cliAgent)[0] ?? HOME_HARNESS;
+        const routed = routeTasks([task], p.cliAgent, customs)[0] ?? HOME_HARNESS;
         await db.insert(tasks).values({
           projectId: pid,
           title: task.slice(0, 120),
@@ -183,7 +187,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
           content: `Task queued from swarm-cli: "${task.slice(0, 120)}"`,
           meta: {},
         });
-        say(`✓ task queued — #${existing.length + 1} on the board · routed to ${harnessById(routed).name}`, "ok");
+        say(`✓ task queued — #${existing.length + 1} on the board · routed to ${resolveHarnessDef(routed, customs).name}`, "ok");
         if (reopened) say("mission reopened at build — the shipped output continues", "warn");
         say("◈ swarm waking — watch the chat", "dim");
         wake = true;
