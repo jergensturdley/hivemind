@@ -1,5 +1,5 @@
 import { HARNESSES } from "@/lib/harnesses";
-import type { SwarmCtx } from "@/lib/sim";
+import type { SwarmCtx } from "@/lib/spec";
 
 export type HarnessFile = {
   path: string;

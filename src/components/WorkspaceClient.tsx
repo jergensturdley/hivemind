@@ -7,6 +7,7 @@ import { AGENTS, cliAgentById, speakerOf } from "@/lib/agents";
 import { providerById } from "@/lib/providers";
 import type { WireArtifact, WireMessage } from "@/lib/events";
 import { useSwarm } from "@/components/useSwarm";
+import { activityLabel, activityOf } from "@/components/activity";
 import { Workbench, type WorkbenchTab } from "@/components/Workbench";
 import { Terminal } from "@/components/Terminal";
 import { Avatar, Md, StageTrack, cls, clock } from "@/components/ui";
@@ -74,6 +75,7 @@ export function WorkspaceClient({ projectId, user, autoRun }: { projectId: numbe
   const awaiting = project?.stage === "awaiting_approval";
   const isDone = project?.stage === "done";
   const idle = booted && !running && project && project.stage !== "done" && project.stage !== "awaiting_approval" && messages.length > 0;
+  const activity = activityOf({ running, stage: project?.stage, typing, tasks });
 
   const openArtifact = (a: WireArtifact) => {
     const t: WorkbenchTab = a.type === "file" ? "files" : a.type === "arch" ? "plan" : a.type === "spec" ? "spec" : "review";
@@ -118,13 +120,13 @@ export function WorkspaceClient({ projectId, user, autoRun }: { projectId: numbe
     );
   }
 
-  const modeLabel = llmMode ? "LIVE" : keysConfigured ? "KEYS" : "SIM";
+  const modeLabel = llmMode ? "LIVE" : keysConfigured ? "KEYS" : "OFF";
   const modeTitle = llmMode
     ? "Live model active"
     : keysConfigured
       ? "Keys ready — launch to go live"
       : "Add keys in Settings to run live models";
-  const modeLong = llmMode ? "● LIVE MODEL" : keysConfigured ? "◌ KEYS READY" : "◌ SIM ENGINE";
+  const modeLong = llmMode ? "● LIVE MODEL" : keysConfigured ? "◌ KEYS READY" : "◌ NO KEYS";
   const primaryAction = running ? (
     <button type="button" onClick={() => action("pause")} className={`${cls.btn} shrink-0`}>
       Pause
@@ -222,7 +224,13 @@ export function WorkspaceClient({ projectId, user, autoRun }: { projectId: numbe
               <div
                 key={a.id}
                 className="flex shrink-0 items-center gap-1.5"
-                title={routes[a.id] ? `${a.name} — ${a.role} · ${routes[a.id]}` : `${a.name} — ${a.role}. ${a.blurb}`}
+                title={
+                  activity?.agent === a.id
+                    ? `${a.name} ${activityLabel(activity)}${activity.target ? ` — ${activity.target}` : ""}`
+                    : routes[a.id]
+                      ? `${a.name} — ${a.role} · ${routes[a.id]}`
+                      : `${a.name} — ${a.role}. ${a.blurb}`
+                }
               >
                 <Avatar hue={a.hue} glyph={a.glyph} size={22} speaking={typing === a.id} />
                 <span className={`text-[11px] font-semibold ${typing === a.id ? "text-ink" : "text-dim"}`}>{a.name}</span>
@@ -245,6 +253,28 @@ export function WorkspaceClient({ projectId, user, autoRun }: { projectId: numbe
               prefer: <b className="font-mono text-mut">{cliAgentById(project.cliAgent).name}</b>
             </span>
           </div>
+
+          {/* activity strip — who is working on what, right now */}
+          {activity && (
+            <div className="fade-up relative shrink-0 overflow-hidden border-b border-line bg-bg2/60">
+              <div className="flex min-w-0 items-center gap-2 px-3 py-1.5 sm:px-4">
+                <AvatarOf author={activity.agent} size={18} />
+                <span className="shrink-0 text-[11px] font-bold text-ink">
+                  {speakerOf(activity.agent).name} <span className="font-semibold text-ok">{activityLabel(activity)}</span>
+                </span>
+                {activity.target && (
+                  <span className="min-w-0 truncate font-mono text-[10.5px] text-mut" title={activity.target}>
+                    “{activity.target}”
+                  </span>
+                )}
+                {activity.via && <span className="shrink-0 text-[10.5px] text-dim">{activity.via}</span>}
+                {routes[activity.agent] && (
+                  <span className="ml-auto hidden shrink-0 truncate font-mono text-[10px] text-dim sm:inline">{routes[activity.agent]}</span>
+                )}
+              </div>
+              <div className="shimmer-line h-[2px] w-full" />
+            </div>
+          )}
 
           {/* feed */}
           <div
@@ -299,7 +329,9 @@ export function WorkspaceClient({ projectId, user, autoRun }: { projectId: numbe
                     <span className="typing-dot h-1.5 w-1.5 rounded-full bg-mut" />
                     <span className="typing-dot h-1.5 w-1.5 rounded-full bg-mut" />
                   </div>
-                  <span className="text-[11px] text-dim">{speakerOf(typing).name} is writing…</span>
+                  <span className="min-w-0 truncate text-[11px] text-dim">
+                    {speakerOf(typing).name} {activity?.agent === typing ? activityLabel(activity) : "is writing"}…
+                  </span>
                 </div>
               )}
             </div>

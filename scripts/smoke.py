@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """Hivemind end-to-end smoke test. Run via `npm run smoke` (server is started for you).
 
+Hivemind runs live models only — there is no simulation engine. Every mission
+here runs against a local mock provider; failure paths must HALT, never fake.
+
 Covers, against a live server + Postgres:
   1. Run-loop protocol: exactly one `end` per SSE connection, reconnect on
      beat-budget rollover, approval gate, mission reaches done, DB parked after.
   2. Harness pack: ship writes all six guidance files with real content.
-  3. Phase 0 honesty: every sim-fallback agent message carries meta.simulated;
-     spec/arch/review/ship artifacts and template files are tagged; harness-pack
-     files and imported files are NOT tagged.
+  3. No-sim honesty: nothing in a mission carries meta.simulated; generated
+     artifacts are tagged generated; harness-pack and imported files are not.
   4. Import missions: existing imported files are kept, not scaffolded over.
   5. Pause parks the mission (running=false, no phantom ACTIVE).
-  6. Live-mode failure surfacing: with an unreachable provider endpoint, the
-     terminal shows "live call failed … — simulated stand-in" and no message
-     claims a provider it didn't use.
-  7. Phase 1 planning: sim-mode task list stays on the template; `cli hive "…"`
-     queues a real task (at the approval gate and by reopening a shipped
-     mission); with a live (mock) provider, Vector extracts the real task list
-     from the model instead of the template.
-  8. Codex (ChatGPT) device login: the mock serves the device-auth endpoints,
+  6. Failure honesty: with an unreachable provider endpoint the swarm HALTS
+     with the real error, points at `doctor`, and fakes nothing.
+  7. `doctor` diagnoses and fixes: flags the dead key, probes the good one,
+     auto-rewrites a retired codex slug.
+  8. `cli hive "…"` queues a real task (at the approval gate and by reopening
+     a shipped mission); Vector extracts the task list from the model.
+  9. Codex (ChatGPT) device login: the mock serves the device-auth endpoints,
      the PKCE token exchange, the model catalog, and the Responses-API SSE —
      a full mission runs end-to-end over the codex provider.
 
@@ -27,6 +28,7 @@ Requires Postgres to be up (npm run db:up).
 import http.client
 import io
 import json
+import re
 import sys
 import threading
 import time
@@ -128,22 +130,12 @@ AGENT_AUTHORS = {"nova", "vector", "sentinel", "probe", "forge"}
 PACK_PATHS = {"HARNESS.md", "AGENTS.md", "CLAUDE.md", "GEMINI.md", "CONVENTIONS.md", ".cursor/rules/project.mdc"}
 
 
-def check_sim_tagging(pj, label):
-    """Phase 0: sim-fallback agent messages + template artifacts are tagged."""
-    untagged = [
-        m["id"]
-        for m in pj["messages"]
-        if m["author"] in AGENT_AUTHORS and m.get("meta", {}).get("simulated") is not True
-    ]
-    check(f"{label}: every specialist-agent message is tagged simulated", not untagged, f"untagged ids: {untagged[:5]}")
-    for a in pj["artifacts"]:
-        tagged = a.get("meta", {}).get("simulated") is True
-        if a["type"] in ("spec", "arch", "review", "ship"):
-            check(f"{label}: {a['type']} artifact '{a['title'][:40]}' tagged simulated", tagged)
-        elif a["type"] == "file" and a.get("path") in PACK_PATHS:
-            check(f"{label}: pack file {a['path']} NOT tagged (it is real)", not tagged)
-        elif a["type"] == "file":
-            check(f"{label}: template file {a.get('path')} tagged simulated", tagged)
+def check_no_sim(pj, label):
+    """Live-only honesty: nothing in a mission may carry meta.simulated."""
+    sim_msgs = [m["id"] for m in pj["messages"] if m.get("meta", {}).get("simulated") is True]
+    check(f"{label}: no simulated stand-in messages", not sim_msgs, f"ids: {sim_msgs[:5]}")
+    sim_arts = [a["id"] for a in pj["artifacts"] if a.get("meta", {}).get("simulated") is True]
+    check(f"{label}: no simulated artifacts", not sim_arts, f"ids: {sim_arts[:5]}")
 
 
 # ---- sign in ----------------------------------------------------------
@@ -159,189 +151,9 @@ missions0 = json.loads(data)["projects"]
 lumen = next((m for m in missions0 if m["name"] == "Lumen Board"), None)
 check("seeded demo mission is marked fixture", lumen is not None and lumen.get("fixture") is True)
 
-# ---- mission 1: pasted spec, full lifecycle (sim mode) ----------------
-status, _, data = req(
-    "POST",
-    "/api/projects",
-    {
-        "name": "Ponyfield Notes",
-        "spec": 'Build "Ponyfield Notes" — a fast local notes app with markdown notes, tag filtering, and full-text search.',
-    },
-)
-pid1 = json.loads(data)["id"]
-conns, rolled_over, done, _, live1 = drive_to_done(pid1, "mission1")
-check("mission1 reaches done", done, f"{conns} connections")
-check("mission1 needed a reconnect (run-loop rollover works)", rolled_over and conns >= 2, f"{conns} conns")
-check("mission1 stayed in sim mode (smoke user has no key)", live1 is False)
+# ---- mock provider (all missions run live against it) -----------------
+MOCK_PORT = 3123  # fixed: smoke.sh points CODEX_AUTH_ISSUER/CODEX_API_BASE here
 
-status, pj1 = get_project(pid1)
-check("mission1 DB stage is done", pj1["project"]["stage"] == "done")
-check("mission1 DB running is false after done", pj1["project"]["running"] is False)
-titles1 = [t["title"] for t in pj1["tasks"]]
-check("mission1 sim mode keeps the template plan (Phase 1: sim unchanged)", titles1 and titles1[0] == "Scaffold schema & data layer", str(titles1[:2]))
-paths = [a.get("path") for a in pj1["artifacts"] if a["type"] == "file"]
-missing = PACK_PATHS - set(paths)
-check("ship writes the full 6-file harness pack", not missing, f"missing: {sorted(missing)}" if missing else "all six present")
-cl = next((a for a in pj1["artifacts"] if a.get("path") == "CLAUDE.md"), None)
-check("CLAUDE.md pack file has real content", bool(cl) and "Ponyfield" in cl["content"] and len(cl["content"]) > 200)
-
-# Phase 4: export — python's zipfile parses it and verifies every CRC.
-status, _, zbytes1 = req("GET", f"/api/projects/{pid1}/export")
-check("sim export returns a zip", status == 200 and zbytes1[:2] == b"PK")
-try:
-    z1 = zipfile.ZipFile(io.BytesIO(zbytes1))
-    names1 = z1.namelist()
-    crc1 = z1.testzip()
-except Exception as e:  # noqa: BLE001
-    z1, names1, crc1 = None, [], str(e)
-check("zip integrity (CRC verified on every entry)", crc1 is None, str(crc1))
-expected_tree = {
-    "HARNESS.md", "AGENTS.md", "CLAUDE.md", "GEMINI.md", "CONVENTIONS.md", ".cursor/rules/project.mdc",
-    "src/lib/db.ts", "docs/spec.md", "docs/architecture.md", "docs/review.md", "docs/qa-checklist.md", "docs/ship-report.md",
-}
-check("export contains the full tree (pack, code, docs)", expected_tree <= set(names1), str(sorted(expected_tree - set(names1))))
-check("sim export carries SIMULATED.md notice", "SIMULATED.md" in names1)
-check(
-    "SIMULATED.md lists the template files",
-    z1 is not None and "src/lib/db.ts" in z1.read("SIMULATED.md").decode(),
-)
-check_sim_tagging(pj1, "mission1")
-
-# ---- mission 2: imported folder ---------------------------------------
-files = [
-    {"path": "ponyrepo/README.md", "content": "# Pony Repo\nA tiny existing app that already works.\n"},
-    {"path": "ponyrepo/package.json", "content": json.dumps({"name": "pony-repo", "description": "existing local app"}, indent=2)},
-    {"path": "ponyrepo/src/lib/db.ts", "content": "export const db = {\n  query: (q: string): unknown[] => [],\n};\n"},
-    {"path": "ponyrepo/src/app/page.tsx", "content": "export default function Home() {\n  return <main>pony repo</main>;\n}\n"},
-]
-spec2 = (
-    "Pony Repo — existing project imported into Hivemind.\n\nA tiny existing app that already works.\n\n"
-    "## Tree (imported)\n- `README.md`\n- `package.json`\n- `src/lib/db.ts`\n- `src/app/page.tsx`\n\n"
-    "Continue from this codebase. Do not scaffold a blank app."
-)
-status, _, data = req("POST", "/api/projects", {"name": "Pony Repo", "spec": spec2, "files": files})
-pid2 = json.loads(data)["id"]
-conns2, _, done2, _, _ = drive_to_done(pid2, "mission2")
-check("mission2 reaches done", done2, f"{conns2} connections")
-
-status, pj2 = get_project(pid2)
-db_arts = [a for a in pj2["artifacts"] if a.get("path") == "src/lib/db.ts"]
-check("imported src/lib/db.ts kept (exactly one artifact)", len(db_arts) == 1, f"{len(db_arts)} artifacts")
-check(
-    "imported src/lib/db.ts content untouched",
-    len(db_arts) == 1 and db_arts[0]["content"] == files[2]["content"],
-)
-check(
-    "imported file NOT tagged simulated (it is real user content)",
-    len(db_arts) == 1 and db_arts[0].get("meta", {}).get("simulated") is not True,
-)
-msgs2 = " ".join(m["content"] for m in pj2["messages"])
-check("forge reports keeping the imported file", "src/lib/db.ts" in msgs2 and ("kept" in msgs2 or "already covers" in msgs2))
-
-# ---- mission 3: pause parks the mission -------------------------------
-status, _, data = req(
-    "POST", "/api/projects", {"name": "Pause Probe", "spec": 'Build "Pause Probe" — a habit tracker with streaks and weekly digests.'}
-)
-pid3 = json.loads(data)["id"]
-result = {}
-
-
-def run_stream():
-    result["r"] = stream(pid3, timeout=90)
-
-
-t = threading.Thread(target=run_stream)
-t.start()
-time.sleep(4)
-req("POST", f"/api/projects/{pid3}/action", {"type": "pause"})
-t.join(95)
-status, pj3 = get_project(pid3)
-check("pause parks mission (DB running=false)", pj3["project"]["running"] is False, f"stage={pj3['project']['stage']}")
-last3 = result.get("r", (None, None, [], False))[1]
-check("pause end event says running=false", last3 is not None and last3.get("running") is False, str(last3))
-
-# ---- mission 4: live-mode failure surfacing with an unreachable endpoint
-status, _, data = req(
-    "POST",
-    "/api/keys",
-    {
-        "provider": "custom",
-        "label": "smoke-unreachable",
-        "baseUrl": "http://127.0.0.1:9",  # closed port — instant connection refusal, offline-safe
-        "secret": "not-a-real-key",
-        "model": "smoke-model",
-        "isDefault": True,
-    },
-)
-bad_key_id = json.loads(data).get("id")
-check("unreachable key saved", bool(bad_key_id))
-
-status, _, data = req(
-    "POST", "/api/projects", {"name": "Failure Probe", "spec": 'Build "Failure Probe" — a recipe box with import and shopping lists.'}
-)
-pid4 = json.loads(data)["id"]
-conns4, _, done4, terms4, live4 = drive_to_done(pid4, "mission4")
-check("mission4 reaches done despite provider failures (sim stand-in)", done4, f"{conns4} connections")
-check("mission4 runs in live mode (key configured)", live4 is True)
-check(
-    "terminal surfaces the live call failure",
-    any("live call failed" in t for t in terms4),
-    f"{sum('live call failed' in t for t in terms4)} failure lines",
-)
-status, pj4 = get_project(pid4)
-no_provider = [m["id"] for m in pj4["messages"] if m.get("meta", {}).get("provider")]
-check("no message claims a provider (all calls failed)", not no_provider, f"ids: {no_provider[:5]}")
-check_sim_tagging(pj4, "mission4")
-check("term surfaces task-generation failure", any("generation failed" in t for t in terms4))
-check(
-    "failed tasks stay on the board (none marked done)",
-    len(pj4["tasks"]) > 0 and all(t["status"] != "done" for t in pj4["tasks"]),
-    str([(t["title"][:24], t["status"]) for t in pj4["tasks"]]),
-)
-check("failed tasks carry the visible failure marker", all("⚠" in t["detail"] for t in pj4["tasks"]))
-msgs4 = " ".join(m["content"] for m in pj4["messages"])
-check("atlas explains the failure and the requeue path", "could not be generated" in msgs4 and "cli hive" in msgs4)
-if bad_key_id:
-    req("PATCH", "/api/keys", {"id": bad_key_id, "model": ""})  # out of the ready set before the mock run
-
-# ---- mission 5: `cli hive "task"` queues real work ---------------------
-status, _, data = req(
-    "POST", "/api/projects", {"name": "Cli Queue", "spec": 'Build "Cli Queue" — a reading queue with shareable lists.'}
-)
-pid5 = json.loads(data)["id"]
-ends5, last5, _, _ = stream(pid5)
-check("mission5 first connection reaches the approval gate", last5 is not None and last5.get("awaiting") is True, str(last5))
-
-status, _, data = req("POST", f"/api/projects/{pid5}/cli", {"command": 'cli hive "Add an export button"'})
-cli_res = json.loads(data)
-check("cli hive queues the task", any("task queued" in l.get("text", "") for l in cli_res.get("lines", [])), str(cli_res.get("lines")))
-check("cli hive response carries the wake flag", cli_res.get("wake") is True)
-status, pj5 = get_project(pid5)
-check("queued task is on the board as backlog", any(t["title"] == "Add an export button" and t["status"] == "backlog" for t in pj5["tasks"]))
-
-# Phase 5: a chatty "yes, but…" is a revision, not an approval; "approve" approves.
-req("POST", f"/api/projects/{pid5}/messages", {"content": "yes I like it but change the name to Queue Plus"})
-_, last5b, _, _ = stream(pid5)
-check("chatty yes-but message does not approve the gate", last5b is not None and last5b.get("awaiting") is True, str(last5b))
-req("POST", f"/api/projects/{pid5}/messages", {"content": "approve"})
-
-conns5, _, done5, _, _ = drive_to_done(pid5, "mission5")
-check("mission5 reaches done with the queued task", done5)
-status, pj5 = get_project(pid5)
-check("queued task got built", any(t["title"] == "Add an export button" and t["status"] == "done" for t in pj5["tasks"]))
-
-# queue on a SHIPPED mission reopens it at build
-status, _, data = req("POST", f"/api/projects/{pid5}/cli", {"command": 'cli hive "Add a dark mode toggle"'})
-reopen_res = json.loads(data)
-check("cli hive on a done mission wakes and reports reopen", reopen_res.get("wake") is True and any("reopened" in l.get("text", "") for l in reopen_res.get("lines", [])))
-status, pj5 = get_project(pid5)
-check("done mission reopened at build", pj5["project"]["stage"] == "build")
-conns5b, _, done5b, _, _ = drive_to_done(pid5, "mission5b")
-check("mission5 ships again after the extension", done5b)
-status, pj5 = get_project(pid5)
-check("extension task got built", any(t["title"] == "Add a dark mode toggle" and t["status"] == "done" for t in pj5["tasks"]))
-
-# ---- mission 6: live task extraction via a mock provider ----------------
 MOCK_TASKS = json.dumps(
     [
         {"title": "Wire the photon catalog schema", "detail": "Add the photon table and seed script in src/lib/db.ts."},
@@ -366,35 +178,52 @@ MOCK_BUILD = (
     "SUMMARY: Photon catalog with rarity tiers wired for the browse panel."
 )
 
-REVIEW_CHANGES = (
-    "# Code review — Photon Ledger\n"
-    "\n"
-    "## Findings\n"
-    "1. **[P1] `src/lib/photon-catalog.ts`** — photon reads have no pagination; the table will grow unbounded.\n"
-    "2. **[P3]** README would benefit from a rarity table.\n"
-    "\n"
-    "VERDICT: CHANGES: src/lib/photon-catalog.ts"
-)
-REVIEW_APPROVED = "# Code review — Photon Ledger\n\n## Findings\n- No blocking issues; rarity mapping is consistent.\n\nVERDICT: APPROVED"
-QA_STATIC = "# QA checklist — static review\n\n- Photon catalog paths reviewed against the schema.\n- Nothing was executed — static review only."
+REVIEW_APPROVED = "# Code review\n\n## Findings\n- No blocking issues; the work holds up.\n\nVERDICT: APPROVED"
+QA_STATIC = "# QA checklist — static review\n\n- Paths reviewed against the schema.\n- Nothing was executed — static review only."
 MOCK_SHIP = (
-    "# Ship report — Photon Ledger\n\n"
-    "## What shipped\n- src/lib/photon-catalog.ts — photon catalog with rarity tiers.\n\n"
+    "# Ship report\n\n"
+    "## What shipped\n- The workspace files listed above.\n\n"
     "## How it was verified\nStatic review only — nothing was executed.\n\n"
     "## Next moves\n- Wire a real provider key and re-run the mission.\n"
 )
 
 
-MOCK_PORT = 3123  # fixed: smoke.sh points CODEX_AUTH_ISSUER/CODEX_API_BASE here
+def review_changes(flagged: str) -> str:
+    return (
+        "# Code review\n"
+        "\n"
+        "## Findings\n"
+        f"1. **[P1] `{flagged}`** — reads have no pagination; the table will grow unbounded.\n"
+        "2. **[P3]** README would benefit from a summary table.\n"
+        "\n"
+        f"VERDICT: CHANGES: {flagged}"
+    )
 
 
 def pick_model_text(msg: str) -> str:
     if "Re-read the fixed files" in msg:
-        return REVIEW_CHANGES if MockLLM.reject_twice else REVIEW_APPROVED
+        return review_changes(MockLLM.last_flagged) if MockLLM.reject_twice else REVIEW_APPROVED
     if "Review the workspace files" in msg:
-        return REVIEW_CHANGES
-    if "code review flagged" in msg:
-        return MOCK_BUILD
+        # Flag the first real workspace file named in the digest.
+        m = re.search(r"^- ([A-Za-z0-9._/-]+\.[A-Za-z0-9]+)\s*$", msg, re.M)
+        MockLLM.last_flagged = m.group(1) if m else "src/lib/photon-catalog.ts"
+        return review_changes(MockLLM.last_flagged)
+    flagged = re.search(r"code review flagged `([^`]+)`", msg)
+    if flagged:
+        path = flagged.group(1)
+        return (
+            f"FILE: {path}\n```ts\nexport const PHOTON_LEDGER_SEED = [];\n"
+            "export const fixed = true; // review findings applied\n```\n\n"
+            "SUMMARY: Applied the review findings."
+        )
+    if "already exists in the imported codebase" in msg:
+        keep = re.search(r"maps to (\S+),", msg)
+        kept_path = keep.group(1) if keep else "the existing file"
+        return f"I read {kept_path} and kept it as-is — it already covers the task. No rewrite needed."
+    if "Pony Repo" in msg and "Implement this task completely" in msg:
+        return "FILE: src/lib/db.ts\n```ts\nexport const db = { kept: true };\n```\n\nSUMMARY: Kept the existing db module."
+    if "Rewrite the product spec" in msg:
+        return "# Spec v2\n\n## Vision\nRevised per the commander's notes — everything else holds.\n"
     if "Implement this task completely" in msg:
         return MOCK_BUILD
     if "JSON array" in msg:
@@ -404,7 +233,7 @@ def pick_model_text(msg: str) -> str:
     if "verification checklist" in msg.lower():
         return QA_STATIC
     if "architecture" in msg.lower():
-        return "# Photon Ledger — Architecture v1\n\n## Stack\nNext.js + Postgres.\n\n## Shape\nbrowser → api → postgres."
+        return "# Architecture v1\n\n## Stack\nNext.js + Postgres.\n\n## Shape\nbrowser → api → postgres."
     return "Copy. Live model on the wire."
 
 
@@ -429,6 +258,7 @@ class MockLLM(BaseHTTPRequestHandler):
     """Auth + chat endpoints for every provider the smoke run exercises. Offline-safe."""
 
     reject_twice = False  # set True to make Sentinel's re-read keep objecting
+    last_flagged = "src/lib/photon-catalog.ts"
     hits: dict[str, int] = {}
     codex_rejections = 0  # 400s served for the retired model slug
 
@@ -488,6 +318,14 @@ class MockLLM(BaseHTTPRequestHandler):
             msg = str((body.get("messages") or [{}])[-1].get("content", ""))
         text = pick_model_text(msg)
         if path.endswith("/responses"):
+            # Mirror production: ChatGPT-account tokens demand store=false.
+            if body.get("store") is not False:
+                self.send_json({"detail": "Store must be set to false"}, status=400)
+                return
+            # Mirror production: the codex backend rejects token caps.
+            if "max_output_tokens" in body:
+                self.send_json({"detail": "Unsupported parameter: max_output_tokens"}, status=400)
+                return
             # Mirror production: the retired slug is rejected with the real
             # 400 so the smoke exercises the app's fallback ladder.
             if body.get("model") == "gpt-5.1-codex":
@@ -522,6 +360,210 @@ status, _, data = req(
 )
 mock_key_id = json.loads(data).get("id")
 check("mock provider key saved", bool(mock_key_id))
+
+# ---- mission 1: pasted spec, full lifecycle (live against the mock) ---
+status, _, data = req(
+    "POST",
+    "/api/projects",
+    {
+        "name": "Ponyfield Notes",
+        "spec": 'Build "Ponyfield Notes" — a fast local notes app with markdown notes, tag filtering, and full-text search.',
+    },
+)
+pid1 = json.loads(data)["id"]
+conns, rolled_over, done, _, live1 = drive_to_done(pid1, "mission1")
+check("mission1 reaches done", done, f"{conns} connections")
+check("mission1 needed a reconnect (run-loop rollover works)", rolled_over and conns >= 2, f"{conns} conns")
+check("mission1 ran in live mode", live1 is True)
+
+status, pj1 = get_project(pid1)
+check("mission1 DB stage is done", pj1["project"]["stage"] == "done")
+check("mission1 DB running is false after done", pj1["project"]["running"] is False)
+titles1 = [t["title"] for t in pj1["tasks"]]
+check("mission1 plan comes from the live model (not a template)", titles1 and titles1[0] == "Wire the photon catalog schema", str(titles1[:2]))
+paths = [a.get("path") for a in pj1["artifacts"] if a["type"] == "file"]
+missing = PACK_PATHS - set(paths)
+check("ship writes the full 6-file harness pack", not missing, f"missing: {sorted(missing)}" if missing else "all six present")
+cl = next((a for a in pj1["artifacts"] if a.get("path") == "CLAUDE.md"), None)
+check("CLAUDE.md pack file has real content", bool(cl) and "Ponyfield" in cl["content"] and len(cl["content"]) > 200)
+
+# Phase 4: export — python's zipfile parses it and verifies every CRC.
+status, _, zbytes1 = req("GET", f"/api/projects/{pid1}/export")
+check("export returns a zip", status == 200 and zbytes1[:2] == b"PK")
+try:
+    z1 = zipfile.ZipFile(io.BytesIO(zbytes1))
+    names1 = z1.namelist()
+    crc1 = z1.testzip()
+except Exception as e:  # noqa: BLE001
+    z1, names1, crc1 = None, [], str(e)
+check("zip integrity (CRC verified on every entry)", crc1 is None, str(crc1))
+expected_tree = {
+    "HARNESS.md", "AGENTS.md", "CLAUDE.md", "GEMINI.md", "CONVENTIONS.md", ".cursor/rules/project.mdc",
+    "src/lib/photon-catalog.ts", "docs/spec.md", "docs/architecture.md", "docs/review.md", "docs/qa-checklist.md", "docs/ship-report.md",
+}
+check("export contains the full tree (pack, code, docs)", expected_tree <= set(names1), str(sorted(expected_tree - set(names1))))
+check("export carries NO SIMULATED.md (nothing was faked)", "SIMULATED.md" not in names1)
+check_no_sim(pj1, "mission1")
+
+# ---- mission 2: imported folder ---------------------------------------
+files = [
+    {"path": "ponyrepo/README.md", "content": "# Pony Repo\nA tiny existing app that already works.\n"},
+    {"path": "ponyrepo/package.json", "content": json.dumps({"name": "pony-repo", "description": "existing local app"}, indent=2)},
+    {"path": "ponyrepo/src/lib/db.ts", "content": "export const db = {\n  query: (q: string): unknown[] => [],\n};\n"},
+    {"path": "ponyrepo/src/app/page.tsx", "content": "export default function Home() {\n  return <main>pony repo</main>;\n}\n"},
+]
+spec2 = (
+    "Pony Repo — existing project imported into Hivemind.\n\nA tiny existing app that already works.\n\n"
+    "## Tree (imported)\n- `README.md`\n- `package.json`\n- `src/lib/db.ts`\n- `src/app/page.tsx`\n\n"
+    "Continue from this codebase. Do not scaffold a blank app."
+)
+status, _, data = req("POST", "/api/projects", {"name": "Pony Repo", "spec": spec2, "files": files})
+pid2 = json.loads(data)["id"]
+conns2, _, done2, _, _ = drive_to_done(pid2, "mission2")
+check("mission2 reaches done", done2, f"{conns2} connections")
+
+status, pj2 = get_project(pid2)
+db_arts = [a for a in pj2["artifacts"] if a.get("path") == "src/lib/db.ts"]
+check("imported src/lib/db.ts kept (exactly one artifact)", len(db_arts) == 1, f"{len(db_arts)} artifacts")
+check(
+    "imported src/lib/db.ts content untouched",
+    len(db_arts) == 1 and db_arts[0]["content"] == files[2]["content"],
+)
+check(
+    "imported file NOT tagged simulated (it is real user content)",
+    len(db_arts) == 1 and db_arts[0].get("meta", {}).get("simulated") is not True,
+)
+msgs2 = " ".join(m["content"] for m in pj2["messages"])
+check("forge reports keeping the imported file", "src/lib/db.ts" in msgs2 and ("kept" in msgs2 or "already covers" in msgs2))
+
+# ---- mission 3: pause parks the mission -------------------------------
+status, _, data = req(
+    "POST", "/api/projects", {"name": "Pause Probe", "spec": 'Build "Pause Probe" — a habit tracker with streaks and weekly digests.'}
+)
+pid3 = json.loads(data)["id"]
+result = {}
+
+
+def run_stream():
+    result["r"] = stream(pid3, timeout=90)
+
+
+t = threading.Thread(target=run_stream)
+t.start()
+time.sleep(4)
+req("POST", f"/api/projects/{pid3}/action", {"type": "pause"})
+t.join(95)
+status, pj3 = get_project(pid3)
+check("pause parks mission (DB running=false)", pj3["project"]["running"] is False, f"stage={pj3['project']['stage']}")
+last3 = result.get("r", (None, None, [], False))[1]
+check("pause end event says running=false", last3 is not None and last3.get("running") is False, str(last3))
+
+# ---- mission 4: a dead provider HALTS the run — nothing is faked --------
+status, _, data = req(
+    "POST",
+    "/api/keys",
+    {
+        "provider": "custom",
+        "label": "smoke-unreachable",
+        "baseUrl": "http://127.0.0.1:9",  # closed port — instant connection refusal, offline-safe
+        "secret": "not-a-real-key",
+        "model": "smoke-model",
+        "isDefault": True,
+    },
+)
+bad_key_id = json.loads(data).get("id")
+check("unreachable key saved", bool(bad_key_id))
+
+status, _, data = req(
+    "POST", "/api/projects", {"name": "Failure Probe", "spec": 'Build "Failure Probe" — a recipe box with import and shopping lists.'}
+)
+pid4 = json.loads(data)["id"]
+conns4, _, done4, terms4, live4 = drive_to_done(pid4, "mission4")
+check("mission4 does NOT reach done — the run halts on the dead provider", not done4, f"{conns4} connections")
+check("mission4 ran in live mode (key configured)", live4 is True)
+check(
+    "terminal surfaces the live call failure",
+    any("live call failed" in t for t in terms4),
+    f"{sum('live call failed' in t for t in terms4)} failure lines",
+)
+status, pj4 = get_project(pid4)
+check("halted mission is parked at intake", pj4["project"]["stage"] == "intake" and pj4["project"]["running"] is False, pj4["project"]["stage"])
+no_provider = [m["id"] for m in pj4["messages"] if m.get("meta", {}).get("provider")]
+check("no message claims a provider (the call never succeeded)", not no_provider, f"ids: {no_provider[:5]}")
+check_no_sim(pj4, "mission4")
+msgs4 = " ".join(m["content"] for m in pj4["messages"])
+check("halt message names the failure and points at doctor", "could not run" in msgs4 and "doctor" in msgs4)
+
+# ---- doctor: diagnose + fix -------------------------------------------
+status, _, data = req(
+    "POST",
+    "/api/keys",
+    {
+        "provider": "codex",
+        "label": "smoke-codex-retired",
+        "baseUrl": f"http://127.0.0.1:{MOCK_PORT}",  # mocked codex responses base
+        "secret": "mock-codex",
+        "model": "gpt-5.1-codex",  # retired slug — doctor must rewrite it
+        "isDefault": False,
+    },
+)
+retired_key_id = json.loads(data).get("id")
+check("retired-slug codex key saved", bool(retired_key_id))
+
+status, _, data = req("POST", f"/api/projects/{pid4}/cli", {"command": "doctor"})
+doc_lines = [l.get("text", "") for l in json.loads(data).get("lines", [])]
+doc_text = "\n".join(doc_lines)
+check("doctor flags the unreachable key", any("smoke-unreachable" in t for t in doc_lines if t.startswith("✗")), doc_text[:200])
+check("doctor probes the mock key live", any("smoke-mock-llm" in t and "live" in t for t in doc_lines if t.startswith("✓")), doc_text[:200])
+check("doctor auto-fixes the retired codex slug", any("gpt-5.6-sol" in t and "retired" in t for t in doc_lines), doc_text[:300])
+check("doctor probes the fixed codex key through the mock", any("smoke-codex-retired" in t for t in doc_lines if t.startswith("✓")), doc_text[:300])
+check("doctor summary counts the problems", any("problem" in t for t in doc_lines), doc_text[-160:])
+status, _, data = req("GET", "/api/keys")
+retired_row = next((k for k in json.loads(data)["keys"] if k["id"] == retired_key_id), None)
+check("retired slug rewritten in the DB", retired_row is not None and retired_row["model"] == "gpt-5.6-sol", str(retired_row))
+if bad_key_id:
+    req("PATCH", "/api/keys", {"id": bad_key_id, "model": ""})  # out of the ready set before the mock run
+if mock_key_id:
+    req("PATCH", "/api/keys", {"id": mock_key_id, "isDefault": True})  # the unreachable key stole the default flag
+
+# ---- mission 5: `cli hive "task"` queues real work ---------------------
+status, _, data = req(
+    "POST", "/api/projects", {"name": "Cli Queue", "spec": 'Build "Cli Queue" — a reading queue with shareable lists.'}
+)
+pid5 = json.loads(data)["id"]
+ends5, last5, _, _ = stream(pid5)
+check("mission5 first connection reaches the approval gate", last5 is not None and last5.get("awaiting") is True, str(last5))
+
+status, _, data = req("POST", f"/api/projects/{pid5}/cli", {"command": 'cli hive "Add an export button"'})
+cli_res = json.loads(data)
+check("cli hive queues the task", any("task queued" in l.get("text", "") for l in cli_res.get("lines", [])), str(cli_res.get("lines")))
+check("cli hive response carries the wake flag", cli_res.get("wake") is True)
+status, pj5 = get_project(pid5)
+check("queued task is on the board as backlog", any(t["title"] == "Add an export button" and t["status"] == "backlog" for t in pj5["tasks"]))
+
+# Phase 5: a chatty "yes, but…" is a revision, not an approval; "approve" approves.
+req("POST", f"/api/projects/{pid5}/messages", {"content": "yes I like it but change the name to Queue Plus"})
+_, last5b, _, _ = stream(pid5)
+check("chatty yes-but message does not approve the gate", last5b is not None and last5b.get("awaiting") is True, str(last5b))
+req("POST", f"/api/projects/{pid5}/messages", {"content": "approve"})
+
+conns5, _, done5, _, _ = drive_to_done(pid5, "mission5")
+check("mission5 reaches done with the queued task", done5)
+status, pj5 = get_project(pid5)
+check("queued task got built", any(t["title"] == "Add an export button" and t["status"] == "done" for t in pj5["tasks"]))
+
+# queue on a SHIPPED mission reopens it at build
+status, _, data = req("POST", f"/api/projects/{pid5}/cli", {"command": 'cli hive "Add a dark mode toggle"'})
+reopen_res = json.loads(data)
+check("cli hive on a done mission wakes and reports reopen", reopen_res.get("wake") is True and any("reopened" in l.get("text", "") for l in reopen_res.get("lines", [])))
+status, pj5 = get_project(pid5)
+check("done mission reopened at build", pj5["project"]["stage"] == "build")
+conns5b, _, done5b, _, _ = drive_to_done(pid5, "mission5b")
+check("mission5 ships again after the extension", done5b)
+status, pj5 = get_project(pid5)
+check("extension task got built", any(t["title"] == "Add a dark mode toggle" and t["status"] == "done" for t in pj5["tasks"]))
+
+# ---- mission 6: Photon Ledger full lifecycle on the mock provider ---
 
 status, _, data = req(
     "POST", "/api/projects", {"name": "Photon Ledger", "spec": 'Build "Photon Ledger" — a catalog of collectible photons with rarity tiers.'}
@@ -681,7 +723,7 @@ mock_server.shutdown()
 # ---- cleanup ----------------------------------------------------------
 for pid in (pid1, pid2, pid3, pid4, pid5, pid6, pid7, pid8):
     req("DELETE", f"/api/projects/{pid}")
-for key_id in (mock_key_id, codex_key_id):
+for key_id in (mock_key_id, codex_key_id, retired_key_id):
     if key_id:
         req("PATCH", "/api/keys", {"id": key_id, "model": ""})  # take it out of the ready set
 

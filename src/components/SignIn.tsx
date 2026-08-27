@@ -58,7 +58,7 @@ export function SignIn() {
             {[
               ["01", "Paste a single spec — the swarm handles intake → plan → build → review → ship"],
               ["02", "Intervene any time: @mention an agent mid-run and it answers in-thread"],
-              ["03", "BYOK: OpenAI / Anthropic compatible, or run the built-in simulation engine"],
+              ["03", "BYOK: any OpenAI / Anthropic-compatible endpoint, ChatGPT sign-in, or local models — live only"],
             ].map(([n, t]) => (
               <div key={n} className="flex items-start gap-3">
                 <span className="mt-0.5 font-mono text-[11px] font-bold text-honey">{n}</span>

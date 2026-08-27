@@ -65,6 +65,7 @@ export function Terminal({
         <div className="hidden items-center gap-2 text-[10px] font-semibold text-dim md:flex">
           <span className="rounded border border-line px-1.5 py-0.5 font-mono">help</span>
           <span className="rounded border border-line px-1.5 py-0.5 font-mono">status</span>
+          <span className="rounded border border-line px-1.5 py-0.5 font-mono">doctor</span>
           <span className="rounded border border-line px-1.5 py-0.5 font-mono">harness</span>
           <span className="rounded border border-line px-1.5 py-0.5 font-mono">{`cli ${agent.id} "task"`}</span>
         </div>

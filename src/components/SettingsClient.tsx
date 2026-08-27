@@ -406,7 +406,8 @@ export function SettingsClient({ user }: { user: { id: number; name: string; ema
             <h2 className="font-display text-[16px] font-bold text-ink">Bring your own keys</h2>
             <p className="mt-1 text-[12.5px] text-mut">
               Save a key, we poll that provider for models, then you pick one. Keys stay in this machine’s database and are
-              only used server-side. Without a selected model, missions stay on the simulation engine.
+              only used server-side. Without a selected model, missions cannot run — the terminal’s `doctor` command
+              diagnoses and fixes whatever blocks a live run.
             </p>
 
             {keys.length > 0 && (
@@ -571,7 +572,7 @@ export function SettingsClient({ user }: { user: { id: number; name: string; ema
                       <b className="text-ink">We poll models</b> from the provider&apos;s native catalog.
                     </li>
                     <li>
-                      <b className="text-ink">Select a model</b> — the swarm stays in simulation until you do.
+                      <b className="text-ink">Select a model</b> — the swarm cannot run until you do.
                     </li>
                   </ol>
                 )}

@@ -253,8 +253,8 @@ export function StudioClient({ user }: { user: { id: number; name: string; email
           <div className="mb-6 flex flex-wrap items-center gap-3 rounded-lg border border-honey/30 bg-honey/[0.05] px-4 py-3">
             <span className="text-honey">◌</span>
             <span className="text-[13px] text-mut">
-              Running on the <b className="text-ink">simulation engine</b> — missions complete end-to-end with scripted
-              specialists. Wire up your own OpenAI / Anthropic key for live models.
+              <b className="text-ink">No keys configured</b> — missions run on live models only and cannot start without
+              one. Wire up an OpenAI / Anthropic-compatible key or ChatGPT sign-in.
             </span>
             <button onClick={() => router.push("/settings")} className={`${cls.btn} ml-auto`}>
               Add keys →

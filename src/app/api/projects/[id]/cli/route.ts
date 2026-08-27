@@ -6,6 +6,7 @@ import { getSessionUser } from "@/lib/session";
 import { AGENTS, HARNESSES, harnessById, isHarnessId, renderHarnessCmd } from "@/lib/agents";
 import { detectHarness, detectHarnesses } from "@/lib/detect-harness";
 import { HOME_HARNESS, routeTasks } from "@/lib/harness-route";
+import { runDoctor } from "@/lib/doctor";
 import type { TermLine } from "@/lib/events";
 
 export const runtime = "nodejs";
@@ -37,6 +38,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       say("swarm-cli — hivemind multi-harness bridge", "ok");
       say("  help                 this help");
       say("  status               mission state, stage, progress");
+      say("  doctor               diagnose + fix whatever blocks live runs");
       say("  agents               list the swarm roster");
       say("  harness              list coding-agent bridges + PATH");
       say("  harness use <id>     switch this mission's execution bridge");
@@ -63,10 +65,16 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       say(`mission     ${p.name}`, "ok");
       say(`stage       ${p.stage}${p.running ? "  (swarm active)" : ""}`);
       say(`tasks       ${done}/${tks.length} complete`);
-      say(`engine      ${keys.length ? "BYOK — live model" : "simulation — add a key in Settings"}`);
+      say(`engine      ${keys.length ? "BYOK — live models only" : "offline — add a key in Settings or run doctor"}`);
       say(
         `cli bridge  ${bridge.name}${det.installed ? (bridge.bin ? `  (on PATH: ${det.binPath})` : "  (in-process)") : "  (not on PATH — template only)"}`
       );
+      break;
+    }
+
+    case "doctor": {
+      const report = await runDoctor(user.id);
+      for (const l of report) say(l.text, l.tone);
       break;
     }
 

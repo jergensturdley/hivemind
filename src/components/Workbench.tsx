@@ -237,17 +237,25 @@ function TaskBoard({ tasks }: { tasks: WireTask[] }) {
         return (
           <div key={c.id} className="rounded-lg border border-line bg-bg1/60 p-2.5">
             <div className="mb-2 flex items-center justify-between px-1">
-              <span className="text-[11px] font-bold tracking-wider text-mut uppercase">{c.label}</span>
+              <span className="flex items-center gap-1.5 text-[11px] font-bold tracking-wider text-mut uppercase">
+                {c.label}
+                {c.id === "building" && items.length > 0 && <span className="h-1.5 w-1.5 rounded-full bg-ok pulse-soft" />}
+              </span>
               <span className="rounded-full bg-bg3 px-1.5 text-[10px] font-bold text-dim">{items.length}</span>
             </div>
             <div className="space-y-2">
               {items.map((t) => {
                 const a = agentById(t.assignee);
                 const h = cliAgentById(t.harness || "hive");
+                const live = t.status === "building";
                 return (
-                  <div key={t.id} className="rounded-md border border-line bg-bg2 p-2.5">
+                  <div
+                    key={t.id}
+                    className={`overflow-hidden rounded-md border bg-bg2 p-2.5 ${live ? "border-ok/40" : "border-line"}`}
+                    title={live && a ? `${a.name} is on this task right now` : undefined}
+                  >
                     <div className="flex items-start gap-2">
-                      {a && <Avatar hue={a.hue} glyph={a.glyph} size={18} />}
+                      {a && <Avatar hue={a.hue} glyph={a.glyph} size={18} speaking={live} />}
                       <div className="min-w-0">
                         <div className="text-[12px] leading-snug font-semibold text-ink">{t.title}</div>
                         <div className="mt-1 text-[11px] leading-snug text-dim">{t.detail}</div>
@@ -256,6 +264,7 @@ function TaskBoard({ tasks }: { tasks: WireTask[] }) {
                         </div>
                       </div>
                     </div>
+                    {live && <div className="shimmer-line mt-2 h-[2px] rounded-full" />}
                   </div>
                 );
               })}

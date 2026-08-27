@@ -1,8 +1,9 @@
 /**
  * Hivemind orchestrator — a stage machine that drives a group-chat of
  * specialist agents. Streams SwarmEvents (SSE) while persisting every
- * message, artifact and task to Postgres. Runs in simulation mode without
- * keys, or against any BYOK OpenAI/Anthropic-compatible endpoint.
+ * message, artifact and task to Postgres. Live models only: when a call
+ * fails or no key is configured the swarm halts with the real reason and
+ * points at `doctor` instead of faking output.
  */
 import { db } from "@/db";
 import {
@@ -22,18 +23,10 @@ import { streamChat, type ChatMsg, type LlmConfig } from "@/lib/llm";
 import { createThinkFilter, stripThink } from "@/lib/think";
 import {
   parseSpec,
-  genSpec,
-  genArch,
-  genPlanTasks,
-  genCodeForTask,
-  genReview,
-  genChecklist,
-  genShipSummary,
-  critiqueConcerns,
   approvalAsk,
-  interruptReply,
+  interruptAgent,
   type SwarmCtx,
-} from "@/lib/sim";
+} from "@/lib/spec";
 import type { SwarmEvent, TermLine, WireArtifact, WireMessage, WireTask } from "@/lib/events";
 
 const MAX_BEATS = 4;
@@ -154,11 +147,11 @@ async function resolveCfg(userId: number, agentId: string): Promise<LlmConfig | 
 }
 
 /**
- * A finished agent turn. `simulated` marks content that stood in for the live
- * model (no key configured, call failed, or empty reply) — persisted in meta
- * so the UI can label it.
+ * A finished agent turn. `failed` carries the honest reason when the live
+ * call could not produce content — callers halt the mission instead of
+ * substituting fake output.
  */
-type SpokenResult = { content: string; simulated: boolean };
+type SpokenResult = { content: string; failed?: string };
 
 async function persistSpoken(
   p: ProjectRow,
@@ -167,12 +160,32 @@ async function persistSpoken(
   spoken: SpokenResult,
   extra: Record<string, unknown> = {}
 ): Promise<WireMessage> {
-  const cfg = spoken.simulated ? null : await resolveCfg(p.userId, agent);
+  const cfg = await resolveCfg(p.userId, agent);
   return persistMsg(p.id, agent, kind, spoken.content, {
     ...extra,
     ...(cfg ? { provider: cfg.provider, model: cfg.model } : {}),
-    ...(spoken.simulated ? { simulated: true } : {}),
   });
+}
+
+/**
+ * Stop the run with the real reason — never fake it. Leaves the stage as-is
+ * so Resume works once `doctor` (or Settings) fixes the problem.
+ */
+async function* llmHalt(p: ProjectRow, agent: string, reason: string): AsyncGenerator<SwarmEvent> {
+  const cfg = await resolveCfg(p.userId, agent);
+  const route = cfg ? `${cfg.provider} · ${cfg.model}` : "no key configured";
+  const name = agentById(agent)?.name ?? agent;
+  await db.update(projects).set({ running: false, updatedAt: new Date() }).where(eq(projects.id, p.id));
+  yield { type: "term", lines: [{ text: `✗ ${name} halted the run — ${reason}`, tone: "err" }] };
+  yield {
+    type: "message",
+    msg: await persistMsg(
+      p.id,
+      "system",
+      "status",
+      `**${name} could not run** (${route}) — ${reason}. The swarm halted rather than fake output. Run \`doctor\` in the terminal to diagnose and fix, then Resume.`
+    ),
+  };
 }
 
 /* ---------------- generator utilities ---------------- */
@@ -220,13 +233,12 @@ async function codebaseDigest(p: ProjectRow): Promise<string> {
   );
 }
 
-/** Build a streamed agent turn. Returns the content plus whether a simulated stand-in was used. */
+/** Build a streamed agent turn. Returns the content, or the honest failure reason. */
 async function* spokenTurn(
   p: ProjectRow,
   agent: string,
   opts: {
     instruction: string; // LLM instruction
-    fallback: string; // simulated content
     maxTokens?: number;
     silent?: boolean; // stream without chat deltas (machine-parsed turns)
   }
@@ -234,8 +246,7 @@ async function* spokenTurn(
   yield { type: "turn_start", agent };
   const cfg = await resolveCfg(p.userId, agent);
   if (!cfg) {
-    await sleep(pacing());
-    return { content: opts.fallback, simulated: true };
+    return { content: "", failed: "no key configured for this agent — add one in Settings or run `doctor`" };
   }
   const sys = agentById(agent)?.prompt ?? "You are a helpful agent.";
   const ctx = ctxOf(p);
@@ -252,7 +263,7 @@ async function* spokenTurn(
   ];
   let content = "";
   const think = createThinkFilter();
-  let failed = false;
+  let failedMsg = "";
   try {
     for await (const tok of streamChat(cfg, chat, opts.maxTokens ?? 1400)) {
       const visible = think.push(tok);
@@ -265,27 +276,21 @@ async function* spokenTurn(
       content += tail;
       if (!opts.silent) yield { type: "delta", agent, text: tail };
     }
-  } catch {
-    failed = true;
+  } catch (e) {
+    failedMsg = e instanceof Error ? e.message : String(e);
+    console.error(`spokenTurn(${agent}, ${cfg.provider}/${cfg.model}) failed: ${failedMsg}`);
     content = "";
   }
   content = stripThink(content);
   if (!content.trim()) {
-    // Never fake a live reply silently — say what happened, then stand in.
-    yield {
-      type: "term",
-      lines: [
-        failed
-          ? { text: `live call failed (${cfg.provider}) — simulated stand-in`, tone: "err" }
-          : { text: `live model returned empty (${cfg.provider}) — simulated stand-in`, tone: "warn" },
-      ],
-    };
-    content = opts.fallback;
-    if (!opts.silent) yield { type: "delta", agent, text: content };
-    await sleep(300);
-    return { content, simulated: true };
+    // Never fake a live reply — report the exact failure and let the caller halt.
+    const reason = failedMsg
+      ? `live call failed (${cfg.provider} · ${cfg.model}): ${failedMsg.slice(0, 160)}`
+      : `live model returned empty (${cfg.provider} · ${cfg.model})`;
+    yield { type: "term", lines: [{ text: `✗ ${reason}`, tone: "err" }] };
+    return { content: "", failed: reason };
   }
-  return { content, simulated: false };
+  return { content };
 }
 
 /** Consume spokenTurn, forwarding events through `emit`, and return the result. */
@@ -335,7 +340,7 @@ async function planTasksFor(
   ctx: SwarmCtx,
   archDoc: string,
   emit: (ev: SwarmEvent) => void
-): Promise<{ tasks: { title: string; detail: string }[]; simulated: boolean }> {
+): Promise<{ tasks: { title: string; detail: string }[] } | { failed: string }> {
   const imported = importedPathsOf(p).size > 0;
   const arch = archDoc.length > 2400 ? `${archDoc.slice(0, 2400)}\n…(truncated)` : archDoc;
   const r = await speak(
@@ -345,21 +350,15 @@ async function planTasksFor(
           ? "Derive the implementation task list for EXTENDING the existing imported codebase above. Every task must modify or add to what already exists — never scaffold a fresh app over it."
           : "Derive the implementation task list from the spec and the architecture document below.") +
         `\n\nArchitecture document:\n${arch}\n\nRespond with ONLY a JSON array of 4-8 objects: [{"title": "...", "detail": "..."}]. Titles are short imperative work items; details are one sentence naming the files or surfaces involved. No prose, no code fences.`,
-      fallback: "",
       maxTokens: 900,
       silent: true,
     }),
     emit
   );
-  if (!r.simulated) {
-    const parsed = parseTasks(r.content);
-    if (parsed) return { tasks: parsed, simulated: false };
-    emit({
-      type: "term",
-      lines: [{ text: "task extraction unparseable — template plan used (simulated)", tone: "warn" }],
-    });
-  }
-  return { tasks: genPlanTasks(ctx), simulated: true };
+  if (r.failed) return { failed: r.failed };
+  const parsed = parseTasks(r.content);
+  if (parsed) return { tasks: parsed };
+  return { failed: "task extraction returned no usable JSON task list" };
 }
 
 /* ---------------- live construction (Phase 2) ---------------- */
@@ -373,6 +372,28 @@ export function safeOutPath(raw: string): string | null {
   return path;
 }
 
+const JUNK_SEGMENTS = new Set([
+  ".build",
+  "node_modules",
+  ".next",
+  ".git",
+  ".cache",
+  ".tmp",
+  "dist",
+  "coverage",
+  "__pycache__",
+]);
+
+/**
+ * Build-output and scratch territory — models sometimes "helpfully" emit
+ * debug scripts, fake fixtures, or compiled bundles there, and anything
+ * written can never be deleted, so it must never be reviewed either.
+ */
+function isJunkOutPath(path: string): boolean {
+  const segs = path.split("/");
+  return segs.some((s, i) => JUNK_SEGMENTS.has(s) || (i < segs.length - 1 && /\.app$/.test(s)));
+}
+
 /** Parse Forge's FILE-block output (1–3 files) into paths + contents. Null if unusable. */
 function parseGeneratedFiles(text: string): { files: GeneratedFile[]; summary: string } | null {
   const files: GeneratedFile[] = [];
@@ -381,7 +402,7 @@ function parseGeneratedFiles(text: string): { files: GeneratedFile[]; summary: s
   while ((m = re.exec(text)) && files.length < 3) {
     const path = safeOutPath(m[1]);
     const content = m[2].trimEnd();
-    if (path && content.trim().length > 20) files.push({ path, content: `${content}\n` });
+    if (path && !isJunkOutPath(path) && content.trim().length > 20) files.push({ path, content: `${content}\n` });
   }
   if (!files.length) return null;
   const sum = text.match(/SUMMARY:\s*(.+)/i);
@@ -420,7 +441,7 @@ async function forgeTurn(
   p: ProjectRow,
   task: typeof tasks.$inferSelect,
   emit: (ev: SwarmEvent) => void
-): Promise<{ files: GeneratedFile[]; summary: string } | null> {
+): Promise<{ files: GeneratedFile[]; summary: string } | { failed: string }> {
   const imported = importedPathsOf(p).size > 0;
   const [archRow] = await db
     .select({ content: artifacts.content })
@@ -442,20 +463,21 @@ async function forgeTurn(
     "SUMMARY: <one sentence on what you built>";
   const run = (extra: string) =>
     speak(
-      spokenTurn(p, "forge", { instruction: instruction + extra, fallback: "", maxTokens: 2400, silent: true }),
+      spokenTurn(p, "forge", { instruction: instruction + extra, maxTokens: 2400, silent: true }),
       emit
     );
   let r = await run("");
-  if (!r.simulated) {
+  if (!r.failed) {
     const parsed = parseGeneratedFiles(r.content);
     if (parsed) return parsed;
     r = await run("\n\nREMINDER: the response must start with `FILE: <path>` followed by a fenced code block.");
-    if (!r.simulated) {
+    if (!r.failed) {
       const retry = parseGeneratedFiles(r.content);
       if (retry) return retry;
+      return { failed: "generation returned no usable FILE block after one retry" };
     }
   }
-  return null;
+  return { failed: r.failed };
 }
 
 /** Write a generated file as a new version if the path exists, else a fresh artifact. */
@@ -497,20 +519,26 @@ function parseVerdict(text: string): ReviewVerdict | null {
   return { approved: false, changes: changes.slice(0, 4) };
 }
 
-/** One Forge turn applying review findings to a named file. Null when unusable. */
+/**
+ * One Forge turn applying review findings to a named file.
+ * ok: updated file · halt: live-call failure (mission must stop) ·
+ * unfixed: model answered but produced nothing usable for this path.
+ */
+type FixResult = { status: "ok"; file: GeneratedFile } | { status: "halt"; reason: string } | { status: "unfixed" };
+
 async function fixTurn(
   p: ProjectRow,
   path: string,
   reviewDoc: string,
   emit: (ev: SwarmEvent) => void
-): Promise<GeneratedFile | null> {
+): Promise<FixResult> {
   const [cur] = await db
     .select()
     .from(artifacts)
     .where(and(eq(artifacts.projectId, p.id), eq(artifacts.type, "file"), eq(artifacts.path, path)))
     .orderBy(desc(artifacts.version))
     .limit(1);
-  if (!cur) return null;
+  if (!cur) return { status: "unfixed" };
   const r = await speak(
     spokenTurn(p, "forge", {
       instruction:
@@ -518,52 +546,14 @@ async function fixTurn(
         `Review findings:\n${reviewDoc.slice(0, 1500)}\n\n` +
         `Current ${path}:\n\`\`\`\n${cur.content.slice(0, 4000)}\n\`\`\`\n\n` +
         `Output EXACTLY one file:\nFILE: ${path}\n\`\`\`<language>\n<complete updated content>\n\`\`\``,
-      fallback: "",
       maxTokens: 2400,
       silent: true,
     }),
     emit
   );
-  if (r.simulated) return null;
-  return parseGeneratedFiles(r.content)?.files.find((f) => f.path === path) ?? null;
-}
-
-/** Scripted review pass — sim mode, and the tagged stand-in when a live review call fails. */
-async function* scriptedReview(p: ProjectRow, ctx: SwarmCtx, emit: (ev: SwarmEvent) => void): AsyncGenerator<SwarmEvent> {
-  void emit;
-  const files = (await db.select().from(artifacts).where(and(eq(artifacts.projectId, p.id), eq(artifacts.type, "file")))).map((a) => a.path ?? a.title);
-  const doc = genReview(ctx, files, true);
-  const art = await insertArtifact(p.id, "review", `Code review — ${ctx.product}`, doc, "sentinel", 1, null, { simulated: true });
-  yield { type: "artifact", artifact: art };
-  yield {
-    type: "message",
-    msg: await persistMsg(p.id, "sentinel", "artifact", `Review pass complete. One **P1** on the mutation path — Forge, fix it and I'll re-read. Everything else is clean.`, { artifactId: art.id, simulated: true }),
-  };
-  await sleep(pacing());
-
-  // Forge patches the first file artifact.
-  const first = await db.select().from(artifacts).where(and(eq(artifacts.projectId, p.id), eq(artifacts.type, "file"))).orderBy(asc(artifacts.id)).limit(1);
-  if (first.length) {
-    const f = first[0];
-    const fixed = `${f.content}\n/* P1 fix: routed all writes through rateLimit() + server-side validation */\n`;
-    const [upd] = await db
-      .update(artifacts)
-      .set({ content: fixed, version: f.version + 1, updatedAt: new Date() })
-      .where(eq(artifacts.id, f.id))
-      .returning();
-    yield { type: "artifact", artifact: wireArtifact(upd) };
-    yield {
-      type: "message",
-      msg: await persistMsg(p.id, "forge", "artifact", `P1 squashed — \`${f.path ?? f.title}\` now guards every write. v${upd.version} is up for re-review.`, { artifactId: upd.id, simulated: true }),
-    };
-    await sleep(pacing());
-  }
-  yield {
-    type: "message",
-    msg: await persistMsg(p.id, "sentinel", "chat", `Re-read. Fix is correct and tight — **APPROVED**. Probe, run the verification checklist.`, { simulated: true }),
-  };
-  await setStage(p.id, "ship", true);
-  yield { type: "stage", stage: "ship" };
+  if (r.failed) return { status: "halt", reason: r.failed };
+  const file = parseGeneratedFiles(r.content)?.files.find((f) => f.path === path);
+  return file ? { status: "ok", file } : { status: "unfixed" };
 }
 
 /* ---------------- the orchestrator ---------------- */
@@ -603,10 +593,13 @@ export async function* runSwarm(
       if (!p || !p.running) break;
 
       const beforeTurns = p.turnCount;
-      if (p.interrupt && p.interrupt.trim()) {
-        for await (const ev of handleInterrupt(p)) emit(ev);
-      } else {
-        for await (const ev of stepStage(p, emit)) emit(ev);
+      // Drain queued events (nested emit) before each yielded one so the
+      // client sees turns land one by one instead of one burst per stage —
+      // activity indicators depend on it. Order stays chronological.
+      const stream = p.interrupt && p.interrupt.trim() ? handleInterrupt(p, emit) : stepStage(p, emit);
+      for await (const ev of stream) {
+        yield* flush();
+        yield ev;
       }
       yield* flush();
 
@@ -639,7 +632,7 @@ export async function* runSwarm(
 
 /* ---------------- interrupt handling ---------------- */
 
-async function* handleInterrupt(p: ProjectRow): AsyncGenerator<SwarmEvent> {
+async function* handleInterrupt(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncGenerator<SwarmEvent> {
   const text = (p.interrupt ?? "").trim();
   await db.update(projects).set({ interrupt: null }).where(eq(projects.id, p.id));
   const ctx = ctxOf(p);
@@ -650,12 +643,27 @@ async function* handleInterrupt(p: ProjectRow): AsyncGenerator<SwarmEvent> {
       return;
     }
     // Revision request — rework the spec, keep waiting for approval.
-    const reply = interruptReply(ctx, text);
-    const spoken = await (yield* speakWithFallback(p, reply.agent, text));
-    yield { type: "message", msg: await persistSpoken(p, reply.agent, "chat", spoken) };
+    const replyAgent = interruptAgent(text);
+    const spoken = await (yield* speakInterrupt(p, replyAgent, text));
+    if (spoken.failed) {
+      yield* llmHalt(p, replyAgent, spoken.failed);
+      return;
+    }
+    yield { type: "message", msg: await persistSpoken(p, replyAgent, "chat", spoken) };
     const v = await nextVersion(p.id, "spec");
-    const specDoc = genSpec(ctx, v, text);
-    const art = await insertArtifact(p.id, "spec", `${ctx.product} — Product Spec v${v}`, specDoc, reply.agent, v, null, { simulated: true });
+    const rev = await speak(
+      spokenTurn(p, "nova", {
+        instruction: `Rewrite the product spec as v2 absorbing the commander's revision notes below. Keep the same structure (vision, problem, capability table, primary journey, non-goals, success metrics). Output complete markdown only.\n\nRevision notes: ${text}\n\nCurrent spec:\n${(await latestSpecOf(p.id)) ?? ""}`,
+        maxTokens: 1500,
+        silent: true,
+      }),
+      emit
+    );
+    if (rev.failed) {
+      yield* llmHalt(p, "nova", rev.failed);
+      return;
+    }
+    const art = await insertArtifact(p.id, "spec", `${ctx.product} — Product Spec v${v}`, rev.content, "nova", v, null, { generated: true });
     yield { type: "artifact", artifact: art };
     yield {
       type: "message",
@@ -674,21 +682,22 @@ async function* handleInterrupt(p: ProjectRow): AsyncGenerator<SwarmEvent> {
     return;
   }
 
-  const reply = interruptReply(ctx, text);
-  const spoken = await (yield* speakWithFallback(p, reply.agent, text));
-  yield { type: "message", msg: await persistSpoken(p, reply.agent, "chat", spoken) };
+  const replyAgent = interruptAgent(text);
+  const spoken = await (yield* speakInterrupt(p, replyAgent, text));
+  if (spoken.failed) {
+    yield* llmHalt(p, replyAgent, spoken.failed);
+    return;
+  }
+  yield { type: "message", msg: await persistSpoken(p, replyAgent, "chat", spoken) };
 }
 
-async function* speakWithFallback(p: ProjectRow, agent: string, text: string): AsyncGenerator<SwarmEvent, SpokenResult> {
-  const ctx = ctxOf(p);
-  const fallback = interruptReply(ctx, text).content;
+async function* speakInterrupt(p: ProjectRow, agent: string, text: string): AsyncGenerator<SwarmEvent, SpokenResult> {
   const gen = spokenTurn(p, agent, {
     instruction: `The human commander just said: "${text}". Respond in character in 2-3 sentences, acknowledging and stating what you'll adjust.`,
-    fallback,
     maxTokens: 220,
   });
   yield { type: "turn_start", agent };
-  let result: SpokenResult = { content: fallback, simulated: true };
+  let result: SpokenResult = { content: "", failed: "interrupt reply never ran" };
   for (;;) {
     const step = await gen.next();
     if (step.done) {
@@ -698,6 +707,17 @@ async function* speakWithFallback(p: ProjectRow, agent: string, text: string): A
     if (step.value.type !== "turn_start") yield step.value;
   }
   return result;
+}
+
+/** Latest spec document, for revision turns. */
+async function latestSpecOf(projectId: number): Promise<string | null> {
+  const [row] = await db
+    .select({ content: artifacts.content })
+    .from(artifacts)
+    .where(and(eq(artifacts.projectId, projectId), eq(artifacts.type, "spec")))
+    .orderBy(desc(artifacts.version))
+    .limit(1);
+  return row?.content.slice(0, 4000) ?? null;
 }
 
 async function* approveBuild(p: ProjectRow): AsyncGenerator<SwarmEvent> {
@@ -758,12 +778,14 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
           { text: "✓ session attached — orchestrator has the con", tone: "ok" },
         ],
       };
-      const ackLine = `Reading the brief. I count **${ctx.features.length} first-class capabilities** in your spec — ${ctx.features.slice(0, 3).map((f) => `*${f}*`).join(", ")}${ctx.features.length > 3 ? "…" : ""}. Drafting the v1 spec now.`;
       const ack = await speak(spokenTurn(p, "nova", {
-        instruction: "Acknowledge the mission brief in 2-3 sentences. Mention how many capabilities you extracted and that you are drafting the spec. Be warm and crisp.",
-        fallback: ackLine,
+        instruction: `Acknowledge the mission brief in 2-3 sentences. Mention that you extracted ${ctx.features.length} capabilities and are drafting the spec. Be warm and crisp.`,
         maxTokens: 200,
       }), emit);
+      if (ack.failed) {
+        yield* llmHalt(p, "nova", ack.failed);
+        return;
+      }
       yield { type: "message", msg: await persistSpoken(p, "nova", "chat", ack) };
       await setStage(p.id, "spec", true);
       yield { type: "stage", stage: "spec" };
@@ -771,20 +793,20 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
     }
 
     case "spec": {
-      const fallback = genSpec(ctx, 1);
-      const gen = spokenTurn(p, "nova", {
+      const doc = await speak(spokenTurn(p, "nova", {
         instruction: "Write the complete v1 product spec as structured markdown (vision, problem, capability table, primary journey, non-goals, success metrics). Output markdown only.",
-        fallback,
         maxTokens: 1500,
-      });
-      const doc = await speak(gen, emit);
-      const art = await insertArtifact(p.id, "spec", `${ctx.product} — Product Spec v1`, doc.content, "nova", 1, null, { simulated: doc.simulated });
+      }), emit);
+      if (doc.failed) {
+        yield* llmHalt(p, "nova", doc.failed);
+        return;
+      }
+      const art = await insertArtifact(p.id, "spec", `${ctx.product} — Product Spec v1`, doc.content, "nova", 1, null, { generated: true });
       yield { type: "artifact", artifact: art };
       yield {
         type: "message",
         msg: await persistSpoken(p, "nova", "artifact", {
           content: `Spec v1 is on the table — ${ctx.features.length} capabilities, journeys mapped, non-goals set. Vector, it's yours to architect.`,
-          simulated: doc.simulated,
         }, { artifactId: art.id }),
       };
       await setStage(p.id, "plan", true);
@@ -793,17 +815,23 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
     }
 
     case "plan": {
-      const fallback = genArch(ctx);
-      const gen = spokenTurn(p, "vector", {
+      const doc = await speak(spokenTurn(p, "vector", {
         instruction: "Write the architecture document as markdown: stack table with rationale, a small ASCII system diagram, core data model, file tree, and invariants. Output markdown only.",
-        fallback,
         maxTokens: 1500,
-      });
-      const doc = await speak(gen, emit);
-      const art = await insertArtifact(p.id, "arch", `${ctx.product} — Architecture v1`, doc.content, "vector", 1, null, { simulated: doc.simulated });
+      }), emit);
+      if (doc.failed) {
+        yield* llmHalt(p, "vector", doc.failed);
+        return;
+      }
+      const art = await insertArtifact(p.id, "arch", `${ctx.product} — Architecture v1`, doc.content, "vector", 1, null, { generated: true });
       yield { type: "artifact", artifact: art };
 
+      yield { type: "turn_start", agent: "vector" };
       const plan = await planTasksFor(p, ctx, doc.content, emit);
+      if ("failed" in plan) {
+        yield* llmHalt(p, "vector", plan.failed);
+        return;
+      }
       const routed = routeTasks(plan.tasks.map((t) => t.title), p.cliAgent);
       let i = 0;
       for (const t of plan.tasks) {
@@ -823,7 +851,6 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
         type: "message",
         msg: await persistSpoken(p, "vector", "artifact", {
           content: `Architecture locked and **${plan.tasks.length} tasks** sequenced. Deliberately boring tech, sharp interfaces. Sentinel — tear it apart before we commit.`,
-          simulated: doc.simulated,
         }, { artifactId: art.id }),
       };
       const map = (await taskList(p.id))
@@ -844,36 +871,52 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
     }
 
     case "critique": {
-      const concerns = critiqueConcerns(ctx);
       const c1 = await speak(spokenTurn(p, "sentinel", {
         instruction: `Raise two concrete design-review concerns about this plan (input validation + rate limiting, and unbounded table growth). Write them as short punchy chat messages, not a document. Start with "Two things before we approve."`,
-        fallback: concerns[0],
         maxTokens: 300,
       }), emit);
+      if (c1.failed) {
+        yield* llmHalt(p, "sentinel", c1.failed);
+        return;
+      }
       yield { type: "message", msg: await persistSpoken(p, "sentinel", "chat", c1) };
       await sleep(pacing());
 
       const reply = await speak(spokenTurn(p, "vector", {
         instruction: "Concede both review concerns and state exactly how the plan absorbs them (guards module + pagination + index). Two sentences.",
-        fallback: `Both fair. I'm adding a \`guards\` module — every mutation passes server-side validation and a rate limit — and pagination plus an index on \`events.at\` moves into task 1. Cheap now, painful later.`,
         maxTokens: 220,
       }), emit);
+      if (reply.failed) {
+        yield* llmHalt(p, "vector", reply.failed);
+        return;
+      }
       yield { type: "message", msg: await persistSpoken(p, "vector", "chat", reply) };
       await sleep(pacing());
 
       const novaLine = await speak(spokenTurn(p, "nova", {
         instruction: "As PM, confirm the spec absorbs the review concerns and announce spec v2. Two sentences.",
-        fallback: `Spec absorbs both — non-functional requirements added, v2 published. Nothing about the user promise changed, only how safely we keep it.`,
         maxTokens: 180,
       }), emit);
+      if (novaLine.failed) {
+        yield* llmHalt(p, "nova", novaLine.failed);
+        return;
+      }
       const v = 2;
-      const specDoc = genSpec(ctx, v, "Critique round: harden input validation, rate-limit mutations, paginate + index the events table.");
-      const art = await insertArtifact(p.id, "spec", `${ctx.product} — Product Spec v${v}`, specDoc, "nova", v, null, { simulated: true });
+      const v2 = await speak(spokenTurn(p, "nova", {
+        instruction: "Rewrite the product spec as v2 absorbing the critique: harden input validation, rate-limit mutations, paginate + index the events table. Keep the same structure; output complete markdown only.",
+        maxTokens: 1500,
+        silent: true,
+      }), emit);
+      if (v2.failed) {
+        yield* llmHalt(p, "nova", v2.failed);
+        return;
+      }
+      const art = await insertArtifact(p.id, "spec", `${ctx.product} — Product Spec v${v}`, v2.content, "nova", v, null, { generated: true });
       yield { type: "artifact", artifact: art };
       yield { type: "message", msg: await persistSpoken(p, "nova", "artifact", novaLine, { artifactId: art.id }) };
 
-      const ask = approvalAsk(ctx, (await taskList(p.id)).length);
-      yield { type: "message", msg: await persistMsg(p.id, "atlas", "chat", ask, { simulated: true }) };
+      const ask = approvalAsk((await taskList(p.id)).length);
+      yield { type: "message", msg: await persistMsg(p.id, "atlas", "chat", ask) };
       await setStage(p.id, "awaiting_approval", false);
       yield { type: "stage", stage: "awaiting_approval" };
       return;
@@ -887,19 +930,15 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
 
     case "build": {
       const all = await db.select().from(tasks).where(eq(tasks.projectId, p.id)).orderBy(asc(tasks.sort));
-      const failedMark = (t: typeof tasks.$inferSelect) => t.detail.includes("⚠");
-      const next = all.find((t) => t.status !== "done" && !failedMark(t));
+      const next = all.find((t) => t.status !== "done");
       if (!next) {
-        const failed = all.filter(failedMark).length;
         yield {
           type: "message",
           msg: await persistMsg(
             p.id,
             "atlas",
             "stage",
-            failed
-              ? `**${all.length - failed}/${all.length} tasks returned to Hivemind; ${failed} could not be generated** and stay on the board. Sentinel reviews what landed.`
-              : `**All ${all.length} tasks returned to Hivemind.** Sentinel reads the assembled workspace — review never leaves this room.`
+            `**All ${all.length} tasks returned to Hivemind.** Sentinel reads the assembled workspace — review never leaves this room.`
           ),
         };
         await setStage(p.id, "review", true);
@@ -912,7 +951,6 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
 
       const dest = cliAgentById(next.harness || p.cliAgent);
       const home = dest.id === HOME_HARNESS;
-      const live = !!(await resolveCfg(p.userId, "forge"));
       yield {
         type: "message",
         msg: await persistMsg(
@@ -921,9 +959,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
           "chat",
           home
             ? `Keeping **task ${idx + 1}/${all.length}: ${next.title}** on Hivemind. Forge writes it here — no outbound dispatch.`
-            : live
-              ? `Routing **task ${idx + 1}/${all.length}: ${next.title}** via the **${dest.name}** bridge — a routing label; nothing is spawned. Forge generates natively and the output lands back in this room.`
-              : `Dispatching **task ${idx + 1}/${all.length}: ${next.title}** to **${dest.name}** (simulated dispatch). The output lands back in this room.`
+            : `Routing **task ${idx + 1}/${all.length}: ${next.title}** via the **${dest.name}** bridge — a routing label; nothing is spawned. Forge generates natively and the output lands back in this room.`
         ),
       };
       yield {
@@ -935,42 +971,45 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
       };
       await sleep(pacing() + 400);
 
-      if (live) {
-        // Live mode: Forge generates the real files for this task.
+      {
+        // Forge generates the real files for this task — live models only.
         const gen = await forgeTurn(p, next, emit);
-        if (!gen) {
-          await db
-            .update(tasks)
-            .set({ status: "backlog", detail: `${next.detail} [⚠ generation failed — fix keys and requeue via swarm-cli]` })
-            .where(eq(tasks.id, next.id));
-          yield {
-            type: "term",
-            lines: [
-              { text: `✗ generation failed twice: ${next.title}`, tone: "err" },
-              { text: "◈ task left on the board — mission continues", tone: "dim" },
-            ],
-          };
-          yield {
-            type: "message",
-            msg: await persistMsg(
-              p.id,
-              "atlas",
-              "chat",
-              `**Task "${next.title}" could not be generated.** It stays on the board — fix the provider in Settings and requeue it from the terminal (\`cli hive "…"\`).`
-            ),
-          };
+        if ("failed" in gen) {
+          await db.update(tasks).set({ status: "backlog" }).where(eq(tasks.id, next.id));
+          yield { type: "tasks", tasks: await taskList(p.id) };
+          yield* llmHalt(p, "forge", gen.failed);
+          return;
+        }
+        // Imported trees are audited, never scaffolded over.
+        const importedPaths = importedPathsOf(p);
+        const kept = gen.files.filter((f) => importedPaths.has(f.path));
+        const fresh = gen.files.filter((f) => !importedPaths.has(f.path));
+        for (const k of kept) {
+          yield { type: "term", lines: [{ text: `keep ${k.path} — already in the imported tree`, tone: "ok" }] };
+        }
+        if (kept.length) {
+          const keepNote = await speak(spokenTurn(p, "forge", {
+            instruction: `Task "${next.title}" maps to ${kept.map((k) => k.path).join(", ")}, which already exists in the imported codebase. Confirm in 1-2 sentences that you read the existing file and kept it rather than rewriting it. No code blocks.`,
+            maxTokens: 160,
+          }), emit);
+          if (!keepNote.failed) {
+            yield { type: "message", msg: await persistSpoken(p, "forge", "chat", keepNote) };
+          }
+        }
+        if (!fresh.length) {
+          await db.update(tasks).set({ status: "done" }).where(eq(tasks.id, next.id));
           yield { type: "tasks", tasks: await taskList(p.id) };
           return;
         }
         const fileMeta = { generated: true, ...(!home ? { dispatchedTo: dest.id } : {}) };
         const written: WireArtifact[] = [];
-        for (const file of gen.files) {
+        for (const file of fresh) {
           const art = await writeFileArtifact(p, file, fileMeta);
           written.push(art);
           yield { type: "artifact", artifact: art };
         }
-        const loc = gen.files.reduce((n, f) => n + f.content.split("\n").length, 0);
-        const fileList = gen.files.map((f) => `\`${f.path}\``).join(", ");
+        const loc = fresh.reduce((n, f) => n + f.content.split("\n").length, 0);
+        const fileList = fresh.map((f) => `\`${f.path}\``).join(", ");
         yield {
           type: "term",
           lines: [
@@ -985,93 +1024,43 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
               p.id,
               dest.id,
               "cli",
-              `**${dest.name}** is the routing label for **${next.title}** — nothing was spawned. Forge generated ${gen.files.length} file${gen.files.length > 1 ? "s" : ""} natively (${fileList}, ${loc} loc). ${gen.summary}.`,
+              `**${dest.name}** is the routing label for **${next.title}** — nothing was spawned. Forge generated ${fresh.length} file${fresh.length > 1 ? "s" : ""} natively (${fileList}, ${loc} loc). ${gen.summary}.`,
               { artifactId: written[0]?.id, harness: dest.id, generated: true }
             ),
           };
         }
         const note = await speak(spokenTurn(p, "forge", {
           instruction: `You just implemented task "${next.title}" producing ${fileList}. Report completion in 1-2 sentences${gen.summary ? ` mentioning: ${gen.summary}` : ""}. No code blocks.`,
-          fallback: `Done — ${fileList} in.`,
           maxTokens: 160,
         }), emit);
-        yield { type: "message", msg: await persistSpoken(p, "forge", "artifact", note, { artifactId: written[0]?.id, harness: dest.id }) };
+        // The files already landed; the note is flavor — skip it if the model can't speak.
+        if (!note.failed) {
+          yield { type: "message", msg: await persistSpoken(p, "forge", "artifact", note, { artifactId: written[0]?.id, harness: dest.id }) };
+        }
         await db.update(tasks).set({ status: "done" }).where(eq(tasks.id, next.id));
         yield { type: "tasks", tasks: await taskList(p.id) };
         return;
       }
-
-      const { path, content, summary } = genCodeForTask(next.title, idx, ctx);
-      if (importedPathsOf(p).has(path)) {
-        // The imported tree already has this file — audit it, don't scaffold over it.
-        yield {
-          type: "term",
-          lines: [{ text: `keep ${path} — already in the imported tree`, tone: "ok" }],
-        };
-        const keepNote = await speak(spokenTurn(p, "forge", {
-          instruction: `Task "${next.title}" maps to ${path}, which already exists in the imported codebase. Confirm in 1-2 sentences that you read the existing file and kept it rather than rewriting it. No code blocks.`,
-          fallback: `\`${path}\` already covers **${next.title}** — I read through it and kept it as-is. No rewrite needed.`,
-          maxTokens: 160,
-        }), emit);
-        yield { type: "message", msg: await persistSpoken(p, "forge", "chat", keepNote) };
-        await db.update(tasks).set({ status: "done" }).where(eq(tasks.id, next.id));
-        yield { type: "tasks", tasks: await taskList(p.id) };
-        return;
-      }
-      const loc = content.split("\n").length;
-      const writer = home ? "forge" : dest.id;
-      const art = await insertArtifact(p.id, "file", path, content, writer, 1, path, { simulated: true });
-      yield {
-        type: "term",
-        lines: [
-          { text: `write ${path} (${loc} loc)`, tone: "ok" },
-          { text: home ? "✓ landed in Hivemind" : `✓ landed in Hivemind · ${dest.name} bridge was a routing label`, tone: "ok" },
-        ],
-      };
-      yield { type: "artifact", artifact: art };
-      if (!home) {
-        yield {
-          type: "message",
-          msg: await persistMsg(
-            p.id,
-            dest.id,
-            "cli",
-            `**${dest.name}** is the routing label for **${next.title}** — nothing was spawned. \`${path}\` (${loc} loc) landed in Hivemind. ${summary}.`,
-            { artifactId: art.id, harness: dest.id, simulated: true }
-          ),
-        };
-      }
-      const note = await speak(spokenTurn(p, "forge", {
-        instruction: home
-          ? `You just implemented task "${next.title}" in file ${path}. Report completion in 1-2 sentences mentioning ${summary}. No code blocks.`
-          : `Task "${next.title}" (file ${path}) just landed in the Hivemind workspace under the ${dest.name} routing label. Confirm you integrated it in 1-2 sentences mentioning ${summary}. No code blocks.`,
-        fallback: home
-          ? `Done — \`${path}\` in. ${summary}. Typed end-to-end, no shortcuts.`
-          : `Integrated \`${path}\` (${dest.name} routing label). ${summary}. It's in the workspace — Sentinel can read it here.`,
-        maxTokens: 160,
-      }), emit);
-      yield { type: "message", msg: await persistSpoken(p, "forge", "artifact", note, { artifactId: art.id, harness: dest.id }) };
-      await db.update(tasks).set({ status: "done" }).where(eq(tasks.id, next.id));
-      yield { type: "tasks", tasks: await taskList(p.id) };
-      return;
     }
 
     case "review": {
-      let review: SpokenResult | null = null;
-      const live = !!(await resolveCfg(p.userId, "sentinel"));
-      if (live) {
-        const filesDigest = await priorFilesDigest(p);
-        review = await speak(spokenTurn(p, "sentinel", {
-          instruction:
-            `Review the workspace files below for ${ctx.product} — a real code review: concrete findings with file references and severity (P0–P3), or genuine approval if the work holds up.\n\n${filesDigest}\n\n` +
-            "End with EXACTLY one line:\nVERDICT: APPROVED\nor\nVERDICT: CHANGES: <comma-separated repo paths that need fixes>",
-          fallback: "",
-          maxTokens: 1200,
-          silent: true,
-        }), emit);
+      if (!(await resolveCfg(p.userId, "sentinel"))) {
+        yield* llmHalt(p, "sentinel", "no key configured for this agent — add one in Settings or run `doctor`");
+        return;
       }
-      if (!review || review.simulated) {
-        yield* scriptedReview(p, ctx, emit);
+      const filesDigest = await priorFilesDigest(p);
+      // Announce the speaker before the long silent turn so the room sees
+      // who is working while the model thinks.
+      yield { type: "turn_start", agent: "sentinel" };
+      const review = await speak(spokenTurn(p, "sentinel", {
+        instruction:
+          `Review the workspace files below for ${ctx.product} — a real code review: concrete findings with file references and severity (P0–P3), or genuine approval if the work holds up.\n\n${filesDigest}\n\n` +
+          "End with EXACTLY one line:\nVERDICT: APPROVED\nor\nVERDICT: CHANGES: <comma-separated repo paths that need fixes>",
+        maxTokens: 1200,
+        silent: true,
+      }), emit);
+      if (review.failed) {
+        yield* llmHalt(p, "sentinel", review.failed);
         return;
       }
 
@@ -1107,15 +1096,49 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
       }
 
       // One fix round on the flagged files, then one re-read. Never more.
-      const fixable = (verdict?.changes ?? []).slice(0, 2);
+      // Sentinel sometimes flags paths that are not workspace files (bare
+      // directories, hallucinated names) — drop those instead of burning the
+      // two-slot fix budget on dead lookups.
+      const flagged = (verdict?.changes ?? []).map((c) => c.replace(/\/+$/, ""));
+      const wsPaths = new Set(
+        (
+          await db
+            .select({ path: artifacts.path })
+            .from(artifacts)
+            .where(and(eq(artifacts.projectId, p.id), eq(artifacts.type, "file")))
+        ).map((r) => r.path ?? "")
+      );
+      const valid = [...new Set(flagged)].filter((c) => c && wsPaths.has(c));
+      for (const dead of new Set(flagged.filter((f) => !f || !valid.includes(f)))) {
+        yield { type: "term", lines: [{ text: `skip ${dead || "(no path)"} — not a workspace file`, tone: "warn" }] };
+      }
+      if (!valid.length) {
+        yield {
+          type: "message",
+          msg: await persistMsg(
+            p.id,
+            "atlas",
+            "chat",
+            `**Sentinel requested changes, but none of the flagged paths exist in the workspace** (${flagged.join(", ") || "no paths given"}). The swarm has nothing it can fix — read the findings in the Review tab, reply *ship anyway* to ship over the objection, or send notes and the swarm will rework.`
+          ),
+        };
+        await setStage(p.id, "review", false);
+        return;
+      }
+      const fixable = valid.slice(0, 2);
       const fixed: string[] = [];
       for (const path of fixable) {
-        const file = await fixTurn(p, path, review.content, emit);
-        if (!file) {
+        yield { type: "turn_start", agent: "forge" };
+        const fx = await fixTurn(p, path, review.content, emit);
+        if (fx.status === "halt") {
+          yield* llmHalt(p, "forge", fx.reason);
+          return;
+        }
+        if (fx.status === "unfixed") {
           yield { type: "term", lines: [{ text: `✗ fix failed: ${path}`, tone: "err" }] };
           continue;
         }
-        const wa = await writeFileArtifact(p, file, { generated: true });
+        const wa = await writeFileArtifact(p, fx.file, { generated: true });
         yield { type: "artifact", artifact: wa };
         yield { type: "term", lines: [{ text: `write ${path} (v${wa.version}, review fix)`, tone: "ok" }] };
         fixed.push(path);
@@ -1123,10 +1146,11 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
       if (fixed.length) {
         const fixNote = await speak(spokenTurn(p, "forge", {
           instruction: `You applied review fixes to ${fixed.map((f) => `\`${f}\``).join(", ")}. Report in 1-2 sentences. No code blocks.`,
-          fallback: `Fixes applied to ${fixed.map((f) => `\`${f}\``).join(", ")}.`,
           maxTokens: 140,
         }), emit);
-        yield { type: "message", msg: await persistSpoken(p, "forge", "artifact", fixNote) };
+        if (!fixNote.failed) {
+          yield { type: "message", msg: await persistSpoken(p, "forge", "artifact", fixNote) };
+        }
       }
 
       if (fixed.length) {
@@ -1142,15 +1166,19 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
           seen.add(row.path);
           digest.push(`- ${row.path}\n\`\`\`\n${row.content.slice(0, 800)}\n\`\`\``);
         }
+        yield { type: "turn_start", agent: "sentinel" };
         const re = await speak(spokenTurn(p, "sentinel", {
           instruction:
             `Re-read the fixed files below and judge only the fixes.\n\n${digest.join("\n")}\n\n` +
             "End with EXACTLY one line:\nVERDICT: APPROVED\nor\nVERDICT: CHANGES: <paths>",
-          fallback: "",
           maxTokens: 500,
           silent: true,
         }), emit);
-        const v2 = re.simulated ? null : parseVerdict(re.content);
+        if (re.failed) {
+          yield* llmHalt(p, "sentinel", re.failed);
+          return;
+        }
+        const v2 = parseVerdict(re.content);
         if (v2?.approved) {
           yield {
             type: "message",
@@ -1178,19 +1206,20 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
 
     case "ship": {
       // QA is honest about what it is: static review only, nothing executed.
-      const qaLive = !!(await resolveCfg(p.userId, "probe"));
-      let checklist: SpokenResult = { content: "", simulated: true };
-      if (qaLive) {
-        checklist = await speak(spokenTurn(p, "probe", {
-          instruction:
-            `Produce the verification checklist for the shipped work as markdown. You performed STATIC review of the files only — the checklist must state clearly that nothing was executed. Group checks by capability with concrete file references.\n\n${await priorFilesDigest(p)}`,
-          fallback: "",
-          maxTokens: 900,
-          silent: true,
-        }), emit);
+      if (!(await resolveCfg(p.userId, "probe"))) {
+        yield* llmHalt(p, "probe", "no key configured for this agent — add one in Settings or run `doctor`");
+        return;
       }
-      if (!qaLive || checklist.simulated) {
-        checklist = { content: genChecklist(ctx), simulated: true };
+      yield { type: "turn_start", agent: "probe" };
+      const checklist = await speak(spokenTurn(p, "probe", {
+        instruction:
+          `Produce the verification checklist for the shipped work as markdown. You performed STATIC review of the files only — the checklist must state clearly that nothing was executed. Group checks by capability with concrete file references.\n\n${await priorFilesDigest(p)}`,
+        maxTokens: 900,
+        silent: true,
+      }), emit);
+      if (checklist.failed) {
+        yield* llmHalt(p, "probe", checklist.failed);
+        return;
       }
       const qArt = await insertArtifact(
         p.id,
@@ -1200,15 +1229,16 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
         "probe",
         await nextVersion(p.id, "review"),
         null,
-        checklist.simulated ? { simulated: true } : { generated: true }
+        { generated: true }
       );
       yield { type: "artifact", artifact: qArt };
       const qaNote = await speak(spokenTurn(p, "probe", {
         instruction: "You just published the verification checklist. Report in 2 sentences: you performed static review only and NOTHING was executed. Reference one concrete check. No code blocks.",
-        fallback: "Verification checklist published — static review only, nothing was executed.",
         maxTokens: 140,
       }), emit);
-      yield { type: "message", msg: await persistSpoken(p, "probe", "artifact", qaNote, { artifactId: qArt.id }) };
+      if (!qaNote.failed) {
+        yield { type: "message", msg: await persistSpoken(p, "probe", "artifact", qaNote, { artifactId: qArt.id }) };
+      }
       await sleep(pacing());
 
       const pack = genHarnessPack(ctx);
@@ -1227,7 +1257,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
           "vector",
           "artifact",
           `**Multi-harness pack** landed — ${harnessPackSummary(pack)}. Claude Code, Cursor, Grok, Gemini, Codex, Aider, and OpenCode can pick this repo up cold.`,
-          { paths: pack.map((f) => f.path), simulated: true }
+          { paths: pack.map((f) => f.path) }
         ),
       };
       await sleep(pacing());
@@ -1239,22 +1269,23 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
       const failedTasks = taskRows.filter((t) => t.detail.includes("⚠")).length;
       const paths = [...new Set(fileRows.map((f) => f.path).filter((x): x is string => !!x))];
 
-      const shipLive = !!(await resolveCfg(p.userId, "atlas"));
-      let report: SpokenResult = { content: "", simulated: true };
-      if (shipLive) {
-        report = await speak(spokenTurn(p, "atlas", {
-          instruction:
-            `Write the ship report for this mission as markdown, grounded ONLY in these real facts — do not invent verification that did not happen (QA was static review; nothing was executed).\n\n` +
-            `Stats: ${fileRows.length} files, ${taskRows.length - failedTasks}/${taskRows.length} tasks completed${failedTasks ? `, ${failedTasks} failed` : ""}, ${msgCount} messages, ~${Math.max(1, Math.round(ms / 60000))} min.\n` +
-            `Files: ${paths.join(", ") || "(none)"}\n\n` +
-            `Sections: **What shipped** (derived from the file list), **How it was verified** (state plainly: static review only, nothing executed), **Next moves** (2-3 concrete options).`,
-          fallback: "",
-          maxTokens: 900,
-          silent: true,
-        }), emit);
+      if (!(await resolveCfg(p.userId, "atlas"))) {
+        yield* llmHalt(p, "atlas", "no key configured for this agent — add one in Settings or run `doctor`");
+        return;
       }
-      if (!shipLive || report.simulated) {
-        report = { content: genShipSummary(ctx, { files: fileRows.length, tasks: taskRows.length, messages: msgCount, ms }), simulated: true };
+      yield { type: "turn_start", agent: "atlas" };
+      const report = await speak(spokenTurn(p, "atlas", {
+        instruction:
+          `Write the ship report for this mission as markdown, grounded ONLY in these real facts — do not invent verification that did not happen (QA was static review; nothing was executed).\n\n` +
+          `Stats: ${fileRows.length} files, ${taskRows.length - failedTasks}/${taskRows.length} tasks completed${failedTasks ? `, ${failedTasks} failed` : ""}, ${msgCount} messages, ~${Math.max(1, Math.round(ms / 60000))} min.\n` +
+          `Files: ${paths.join(", ") || "(none)"}\n\n` +
+          `Sections: **What shipped** (derived from the file list), **How it was verified** (state plainly: static review only, nothing executed), **Next moves** (2-3 concrete options).`,
+        maxTokens: 900,
+        silent: true,
+      }), emit);
+      if (report.failed) {
+        yield* llmHalt(p, "atlas", report.failed);
+        return;
       }
       const sArt = await insertArtifact(
         p.id,
@@ -1264,12 +1295,12 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
         "atlas",
         await nextVersion(p.id, "ship"),
         null,
-        report.simulated ? { simulated: true } : { generated: true }
+        { generated: true }
       );
       yield { type: "artifact", artifact: sArt };
       yield {
         type: "message",
-        msg: await persistMsg(p.id, "atlas", "artifact", `🚀 **${ctx.product} is shipped.** Spec honored, review clean, QA passed. Harness pack is in Files so the next agent — any of them — can continue. It's been a pleasure building with you, Commander.`, { artifactId: sArt.id, simulated: true }),
+        msg: await persistMsg(p.id, "atlas", "artifact", `🚀 **${ctx.product} is shipped.** Spec honored, review clean, QA passed. Harness pack is in Files so the next agent — any of them — can continue. It's been a pleasure building with you, Commander.`, { artifactId: sArt.id }),
       };
       yield {
         type: "term",

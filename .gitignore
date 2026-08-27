@@ -3,3 +3,5 @@ node_modules/
 .env
 *.tsbuildinfo
 .impeccable/
+.zcode/
+__pycache__/
