@@ -21,8 +21,20 @@ fi
 bash scripts/db-up.sh
 
 pg_ip="$(container inspect "$PG_NAME" | python3 -c 'import json,sys; n=json.load(sys.stdin)[0]["networks"][0]["ipv4Address"]; print(n.split("/")[0])')"
-database_url="postgresql://${USER_NAME}:${PASSWORD}@${pg_ip}:5432/${DB_NAME}"
-echo "App will reach Postgres at ${pg_ip}:5432"
+# The bridge gateway IP is stable for the life of the network, while the pg
+# container's own IP can change whenever Postgres restarts. Pointing the app at
+# the gateway (which forwards the published DB port) keeps DATABASE_URL valid
+# across pg restarts and reboots, so keys/settings stay reachable. Fall back to
+# the container IP if the gateway can't be determined.
+PG_HOST_PORT="${HIVEMIND_PG_PORT:-5432}"
+gateway_ip="$(container inspect "$PG_NAME" | python3 -c 'import json,sys; n=json.load(sys.stdin)[0]["networks"][0]; print((n.get("ipv4Gateway") or "").split("/")[0])' 2>/dev/null || true)"
+if [[ -n "$gateway_ip" ]]; then
+  database_url="postgresql://${USER_NAME}:${PASSWORD}@${gateway_ip}:${PG_HOST_PORT}/${DB_NAME}"
+  echo "App will reach Postgres via stable gateway ${gateway_ip}:${PG_HOST_PORT}"
+else
+  database_url="postgresql://${USER_NAME}:${PASSWORD}@${pg_ip}:5432/${DB_NAME}"
+  echo "App will reach Postgres at ${pg_ip}:5432 (gateway not detected)"
+fi
 
 if ! container builder status 2>/dev/null | grep -qi running; then
   echo "Starting Apple container builder…"
