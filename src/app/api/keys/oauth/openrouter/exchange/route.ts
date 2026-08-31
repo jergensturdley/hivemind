@@ -32,7 +32,12 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: msg }, { status: 502 });
   }
 
-  await db.update(apiKeys).set({ isDefault: false }).where(eq(apiKeys.userId, user.id));
+  // The default key is a user choice (Settings "Use as default"); a new key
+  // only claims it when it is the account's first.
+  const isFirst = !((await db.select({ id: apiKeys.id }).from(apiKeys).where(eq(apiKeys.userId, user.id))).length);
+  if (isFirst) {
+    await db.update(apiKeys).set({ isDefault: false }).where(eq(apiKeys.userId, user.id));
+  }
   const [row] = await db
     .insert(apiKeys)
     .values({
@@ -43,7 +48,7 @@ export async function POST(req: Request) {
       model: "",
       secret: key,
       authKind: "oauth",
-      isDefault: true,
+      isDefault: isFirst,
     })
     .returning();
 

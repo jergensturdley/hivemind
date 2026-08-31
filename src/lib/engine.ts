@@ -15,7 +15,7 @@ import {
   userSettings,
 } from "@/db/schema";
 import { and, asc, desc, eq, inArray } from "drizzle-orm";
-import { agentById, cliAgentById, renderHarnessCmd } from "@/lib/agents";
+import { agentById, cliAgentById, renderHarnessCmd, AGENT_DISCIPLINE } from "@/lib/agents";
 import { cfgFromKey } from "@/lib/key-auth";
 import { HOME_HARNESS, routeTasks, staysHome } from "@/lib/harness-route";
 import { customHarnessesOf, resolveHarnessDef, type HarnessDef } from "@/lib/harnesses";
@@ -32,6 +32,11 @@ import {
 import type { SwarmEvent, TermLine, WireArtifact, WireMessage, WireTask } from "@/lib/events";
 
 const MAX_BEATS = 4;
+// Review auto-rework budget: how many Forge fix + Sentinel re-read rounds run
+// before the objection is escalated to the operator.
+const REVIEW_FIX_ROUNDS = 3;
+// Workspace files one round may touch, bounding worst-case token spend.
+const REVIEW_FIX_BATCH = 4;
 // Strong approval words count anywhere in a message; weak ones ("yes", "ok",
 // "looks good") only count when the message is nothing but the approval — so
 // "yes, but change the name" is a revision, not an approval.
@@ -154,11 +159,38 @@ async function resolveCfg(userId: number, agentId: string): Promise<LlmConfig | 
 }
 
 /**
- * A finished agent turn. `failed` carries the honest reason when the live
- * call could not produce content — callers halt the mission instead of
- * substituting fake output.
+ * Ordered provider chain for one agent: the assigned key first, the default
+ * key second, then every other ready key. Duplicate providers collapse so the
+ * chain spans distinct brains. Drives turn fallback when a provider is
+ * unreachable or returns an unusable reply.
  */
-type SpokenResult = { content: string; failed?: string };
+async function resolveCfgChain(userId: number, agentId: string): Promise<LlmConfig[]> {
+  const all = await db.select().from(apiKeys).where(eq(apiKeys.userId, userId));
+  const ready = all.filter((k) => k.model.trim());
+  if (!ready.length) return [];
+  const fallback = ready.find((k) => k.isDefault) ?? ready[0];
+
+  const { routes } = await agentRoutes(userId);
+  const assigned = routes?.[agentId]?.keyId ? ready.find((k) => k.id === routes[agentId].keyId) : undefined;
+  const routeModel = routes?.[agentId]?.model?.trim() || "";
+
+  const chain: typeof ready = [];
+  for (const k of [assigned, fallback, ...ready]) {
+    if (!k) continue;
+    const dupe = chain.some((c) => c.id === k.id || (c.provider === k.provider && c.model === k.model));
+    if (!dupe) chain.push(k);
+  }
+  return await Promise.all(
+    chain.slice(0, 4).map((k) => cfgFromKey(k, assigned && k.id === assigned.id && routeModel ? routeModel : k.model))
+  );
+}
+
+/**
+ * A finished agent turn. `failed` carries the honest reason when no provider
+ * in the chain could produce usable content; `via` records the provider that
+ * actually served the reply (it may be a fallback, not the agent's route).
+ */
+type SpokenResult = { content: string; failed?: string; via?: { provider: string; model: string } };
 
 async function persistSpoken(
   p: ProjectRow,
@@ -167,7 +199,7 @@ async function persistSpoken(
   spoken: SpokenResult,
   extra: Record<string, unknown> = {}
 ): Promise<WireMessage> {
-  const cfg = await resolveCfg(p.userId, agent);
+  const cfg = spoken.via ?? (await resolveCfg(p.userId, agent));
   return persistMsg(p.id, agent, kind, spoken.content, {
     ...extra,
     ...(cfg ? { provider: cfg.provider, model: cfg.model } : {}),
@@ -248,14 +280,57 @@ async function* spokenTurn(
     instruction: string; // LLM instruction
     maxTokens?: number;
     silent?: boolean; // stream without chat deltas (machine-parsed turns)
+    validate?: (content: string) => boolean; // machine contract for this turn
+    retryReminder?: string; // appended once when validation fails on a provider
   }
 ): AsyncGenerator<SwarmEvent, SpokenResult> {
   yield { type: "turn_start", agent };
-  const cfg = await resolveCfg(p.userId, agent);
-  if (!cfg) {
+  const chain = await resolveCfgChain(p.userId, agent);
+  if (!chain.length) {
     return { content: "", failed: "no key configured for this agent — add one in Settings or run `doctor`" };
   }
-  const sys = agentById(agent)?.prompt ?? "You are a helpful agent.";
+
+  let lastReason = "";
+  for (let i = 0; i < chain.length; i++) {
+    const cfg = chain[i];
+    let res = yield* attemptTurn(p, agent, cfg, opts);
+
+    if (!res.failed && opts.validate && !opts.validate(res.content)) {
+      // Malformed-but-alive reply: one same-provider retry with the format
+      // reminder before abandoning the provider.
+      if (opts.retryReminder) {
+        res = yield* attemptTurn(p, agent, cfg, {
+          ...opts,
+          instruction: opts.instruction + opts.retryReminder,
+        });
+      }
+      if (!res.failed && opts.validate && !opts.validate(res.content)) {
+        res = { content: "", failed: `reply did not match the required format (${cfg.provider} · ${cfg.model})` };
+      }
+    }
+
+    if (!res.failed) return res;
+    lastReason = res.failed;
+
+    if (i < chain.length - 1) {
+      const next = chain[i + 1];
+      yield {
+        type: "term",
+        lines: [{ text: `⚠ ${lastReason.slice(0, 140)} — falling back to ${next.provider} · ${next.model}`, tone: "warn" }],
+      };
+    }
+  }
+  return { content: "", failed: lastReason };
+}
+
+/** One live-model attempt against a single resolved config. */
+async function* attemptTurn(
+  p: ProjectRow,
+  agent: string,
+  cfg: LlmConfig,
+  opts: { instruction: string; maxTokens?: number; silent?: boolean }
+): AsyncGenerator<SwarmEvent, SpokenResult> {
+  const sys = `${agentById(agent)?.prompt ?? "You are a helpful agent."}\n\n${AGENT_DISCIPLINE}`;
   const ctx = ctxOf(p);
   const digest = await codebaseDigest(p);
   const chat: ChatMsg[] = [
@@ -290,14 +365,14 @@ async function* spokenTurn(
   }
   content = stripThink(content);
   if (!content.trim()) {
-    // Never fake a live reply — report the exact failure and let the caller halt.
+    // Never fake a live reply — report the exact failure so the chain can advance.
     const reason = failedMsg
       ? `live call failed (${cfg.provider} · ${cfg.model}): ${failedMsg.slice(0, 160)}`
       : `live model returned empty (${cfg.provider} · ${cfg.model})`;
     yield { type: "term", lines: [{ text: `✗ ${reason}`, tone: "err" }] };
     return { content: "", failed: reason };
   }
-  return { content };
+  return { content, via: { provider: cfg.provider, model: cfg.model } };
 }
 
 /** Consume spokenTurn, forwarding events through `emit`, and return the result. */
@@ -356,28 +431,25 @@ async function planTasksFor(
 ): Promise<{ tasks: { title: string; detail: string }[] } | { failed: string }> {
   const imported = importedPathsOf(p).size > 0;
   const arch = archDoc.length > 2400 ? `${archDoc.slice(0, 2400)}\n…(truncated)` : archDoc;
+  const specDoc = (await latestSpecOf(p.id)) ?? "";
   const instruction =
     (imported
       ? "Derive the implementation task list for EXTENDING the existing imported codebase above. Every task must modify or add to what already exists — never scaffold a fresh app over it."
-      : "Derive the implementation task list from the spec and the architecture document below.") +
-    `\n\nArchitecture document:\n${arch}\n\nRespond with ONLY a JSON array of 4-8 objects: [{"title": "...", "detail": "..."}]. Titles are short imperative work items; details are one sentence naming the files or surfaces involved. No prose, no code fences.`;
-  const run = (extra: string) =>
-    speak(
-      spokenTurn(p, "vector", { instruction: instruction + extra, maxTokens: 2000, silent: true }),
-      emit
-    );
-  let r = await run("");
-  if (!r.failed) {
-    const parsed = parseTasks(r.content);
-    if (parsed) return { tasks: parsed };
-    r = await run("\n\nREMINDER: respond with ONLY the raw JSON array — no prose, no code fences, no trailing commas.");
-    if (!r.failed) {
-      const retry = parseTasks(r.content);
-      if (retry) return { tasks: retry };
-      return { failed: "task extraction returned no usable JSON task list after one retry" };
-    }
-  }
-  return { failed: r.failed };
+      : "Derive the implementation task list from the spec and the architecture document below — every required capability must land in some task.") +
+    `\n\nProduct spec:\n${specDoc}\n\nArchitecture document:\n${arch}\n\nRespond with ONLY a JSON array of 4-8 objects: [{"title": "...", "detail": "..."}]. Titles are short imperative work items; details are one sentence naming the files or surfaces involved. No prose, no code fences.`;
+  const run = speak(
+    spokenTurn(p, "vector", {
+      instruction,
+      maxTokens: 2000,
+      silent: true,
+      validate: (c) => parseTasks(c) !== null,
+      retryReminder: "\n\nREMINDER: respond with ONLY the raw JSON array — no prose, no code fences, no trailing commas.",
+    }),
+    emit
+  );
+  const r = await run;
+  if (r.failed) return { failed: r.failed };
+  return { tasks: parseTasks(r.content)! };
 }
 
 /* ---------------- live construction (Phase 2) ---------------- */
@@ -493,24 +565,18 @@ async function forgeTurn(
     "Output 1-3 complete files using EXACTLY this format, nothing before or after:\n\n" +
     "FILE: <repo-relative path>\n```<language>\n<complete file content>\n```\n\n" +
     "SUMMARY: <one sentence on what you built>";
-  const run = (extra: string) =>
-    speak(
-      spokenTurn(p, "forge", { instruction: instruction + extra, maxTokens: 8000, silent: true }),
-      emit
-    );
-  let r = await run("");
-  if (!r.failed) {
-    const parsed = parseGeneratedFiles(r.content);
-    if (parsed) return parsed;
-    r = await run("\n\nREMINDER: the response must start with `FILE: <path>` followed by a fenced code block.");
-    if (!r.failed) {
-      const retry = parseGeneratedFiles(r.content);
-      if (retry) return retry;
-      const glimpse = r.content.replace(/\s+/g, " ").trim().slice(0, 140);
-      return { failed: `generation returned no usable FILE block after one retry — model replied: "${glimpse}…"` };
-    }
-  }
-  return { failed: r.failed };
+  const r = await speak(
+    spokenTurn(p, "forge", {
+      instruction,
+      maxTokens: 8000,
+      silent: true,
+      validate: (c) => parseGeneratedFiles(c) !== null,
+      retryReminder: "\n\nREMINDER: the response must start with `FILE: <path>` followed by a fenced code block.",
+    }),
+    emit
+  );
+  if (r.failed) return { failed: r.failed };
+  return parseGeneratedFiles(r.content)!;
 }
 
 /** Write a generated file as a new version if the path exists, else a fresh artifact. */
@@ -547,9 +613,24 @@ function parseVerdict(text: string): ReviewVerdict | null {
   if (m[1].toUpperCase() === "APPROVED") return { approved: true, changes: [] };
   const changes = (m[2] ?? "")
     .split(/[,;]+/)
-    .map((s) => safeOutPath(s))
+    .map((s) => {
+      // Sentinel decorates paths ("`src/a.ts` (handlers)") — keep the first
+      // path-shaped token and let safeOutPath validate it.
+      const tok = s.trim().replace(/[`"']/g, "").split(/[\s(]+/)[0];
+      return tok ? safeOutPath(tok) : null;
+    })
     .filter((s): s is string => !!s);
   return { approved: false, changes: changes.slice(0, 4) };
+}
+
+/** Turn validator matching the verdict contract — used before falling back. */
+function isVerdictText(content: string): boolean {
+  return /VERDICT:\s*(APPROVED|CHANGES?)(\s*:|\s*$)/im.test(content);
+}
+
+/** Turn validator for long-form markdown artifacts: real substance, not a refusal or a stub. */
+function isSubstantialDoc(minLength = 300): (content: string) => boolean {
+  return (content) => content.trim().length >= minLength;
 }
 
 /**
@@ -576,11 +657,13 @@ async function fixTurn(
     spokenTurn(p, "forge", {
       instruction:
         `A code review flagged \`${path}\`. Apply the findings to it and return the COMPLETE updated file.\n\n` +
-        `Review findings:\n${reviewDoc.slice(0, 1500)}\n\n` +
+        `Review findings:\n${reviewDoc.slice(0, 4000)}\n\n` +
         `Current ${path}:\n\`\`\`\n${cur.content.slice(0, 8000)}\n\`\`\`\n\n` +
         `Output EXACTLY one file:\nFILE: ${path}\n\`\`\`<language>\n<complete updated content>\n\`\`\``,
       maxTokens: 8000,
       silent: true,
+      validate: (c) => parseGeneratedFiles(c)?.files.some((f) => f.path === path) ?? false,
+      retryReminder: `\n\nREMINDER: output exactly one FILE block for ${path} with the complete updated content.`,
     }),
     emit
   );
@@ -689,6 +772,7 @@ async function* handleInterrupt(p: ProjectRow, emit: (ev: SwarmEvent) => void): 
         instruction: `Rewrite the product spec as v2 absorbing the commander's revision notes below. Keep the same structure (vision, problem, capability table, primary journey, non-goals, success metrics). Output complete markdown only.\n\nRevision notes: ${text}\n\nCurrent spec:\n${(await latestSpecOf(p.id)) ?? ""}`,
         maxTokens: 3000,
         silent: true,
+        validate: isSubstantialDoc(),
       }),
       emit
     );
@@ -710,6 +794,10 @@ async function* handleInterrupt(p: ProjectRow, emit: (ev: SwarmEvent) => void): 
   if (p.stage === "review" && SHIP_ANYWAY_RE.test(text)) {
     // Unresolved review: only the Commander can ship over Sentinel's objection.
     await persistMsg(p.id, "system", "status", "Commander shipped over the review objection.");
+    await db
+      .update(projects)
+      .set({ ctx: { ...(p.ctx as object), shippedOverObjection: true } as unknown as Record<string, unknown>, running: true, updatedAt: new Date() })
+      .where(eq(projects.id, p.id));
     await setStage(p.id, "ship", true);
     yield { type: "stage", stage: "ship" };
     return;
@@ -799,7 +887,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
           "atlas",
           "stage",
           imported
-            ? `**Mission imported: ${ctx.product}.** ${importedFiles || "Existing"} files are already in the workbench. Hivemind is home base — Nova reads this tree, Vector maps it, Sentinel and Probe stay here. I will dispatch only what still needs building.`
+            ? `**Mission imported: ${ctx.product}.** ${importedFiles === 1 ? "1 file is" : `${importedFiles || "Existing"} files are`} already in the workbench. Hivemind is home base — Nova reads this tree, Vector maps it, Sentinel and Probe stay here. I will dispatch only what still needs building.`
             : `**Mission received: ${ctx.product}.** Hivemind is home base — Nova on product, Vector on architecture, Sentinel on critique, Probe on QA. I will dispatch implementation to coding harnesses and pull every patch back here.`
         ),
       };
@@ -829,6 +917,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
       const doc = await speak(spokenTurn(p, "nova", {
         instruction: "Write the complete v1 product spec as structured markdown (vision, problem, capability table, primary journey, non-goals, success metrics). Output markdown only.",
         maxTokens: 3000,
+        validate: isSubstantialDoc(),
       }), emit);
       if (doc.failed) {
         yield* llmHalt(p, "nova", doc.failed);
@@ -848,9 +937,11 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
     }
 
     case "plan": {
+      const specDoc = (await latestSpecOf(p.id)) ?? "";
       const doc = await speak(spokenTurn(p, "vector", {
-        instruction: "Write the architecture document as markdown: stack table with rationale, a small ASCII system diagram, core data model, file tree, and invariants. Output markdown only.",
+        instruction: `Write the architecture document as markdown: stack table with rationale, a small ASCII system diagram, core data model, file tree, and invariants. It must cover every capability in the spec below — the task breakdown derives from this document, so anything you drop here never gets built.\n\nProduct spec:\n${specDoc}\n\nOutput markdown only.`,
         maxTokens: 3000,
+        validate: isSubstantialDoc(),
       }), emit);
       if (doc.failed) {
         yield* llmHalt(p, "vector", doc.failed);
@@ -905,8 +996,18 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
     }
 
     case "critique": {
+      const specDoc = (await latestSpecOf(p.id)) ?? "";
+      const [archRow] = await db
+        .select({ content: artifacts.content })
+        .from(artifacts)
+        .where(and(eq(artifacts.projectId, p.id), eq(artifacts.type, "arch")))
+        .orderBy(desc(artifacts.version))
+        .limit(1);
+      const planText =
+        `Product spec:\n${specDoc}\n\nArchitecture:\n${archRow?.content.slice(0, 3000) ?? "(none)"}`;
       const c1 = await speak(spokenTurn(p, "sentinel", {
-        instruction: `Raise two concrete design-review concerns about this plan (input validation + rate limiting, and unbounded table growth). Write them as short punchy chat messages, not a document. Start with "Two things before we approve."`,
+        instruction:
+          `Design-review the plan below before build approval. Raise only genuine risks for THIS product — wrong assumptions, missing pieces, unbuildable ordering — not generic checklist items. If nothing blocks, say so plainly. Two or three short punchy chat messages at most.\n\n${planText}`,
         maxTokens: 1000,
       }), emit);
       if (c1.failed) {
@@ -917,7 +1018,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
       await sleep(pacing());
 
       const reply = await speak(spokenTurn(p, "vector", {
-        instruction: "Concede both review concerns and state exactly how the plan absorbs them (guards module + pagination + index). Two sentences.",
+        instruction: `Sentinel's design-review concerns are below. Respond honestly: for each concern, either state concretely how the plan already covers it or will absorb it, or push back with your reasoning. Do not invent work just to look responsive.\n\n${c1.content.slice(0, 1500)}`,
         maxTokens: 800,
       }), emit);
       if (reply.failed) {
@@ -927,29 +1028,30 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
       yield { type: "message", msg: await persistSpoken(p, "vector", "chat", reply) };
       await sleep(pacing());
 
-      const novaLine = await speak(spokenTurn(p, "nova", {
-        instruction: "As PM, confirm the spec absorbs the review concerns and announce spec v2. Two sentences.",
-        maxTokens: 800,
-      }), emit);
-      if (novaLine.failed) {
-        yield* llmHalt(p, "nova", novaLine.failed);
-        return;
-      }
-      const v = 2;
-      const v2 = await speak(spokenTurn(p, "nova", {
-        instruction: "Rewrite the product spec as v2 absorbing the critique: harden input validation, rate-limit mutations, paginate + index the events table. Keep the same structure; output complete markdown only.",
+      const novaTurn = await speak(spokenTurn(p, "nova", {
+        instruction:
+          `Decide whether the product spec needs revision after this architect exchange:\n\n${reply.content.slice(0, 1200)}\n\nIf a concern genuinely changes product requirements, output the complete revised spec as markdown with a first line of REVISED. If nothing material changed, output exactly one line: STANDS: <one-sentence reason>.`,
         maxTokens: 3000,
         silent: true,
+        validate: (c) => /^\s*STANDS:/im.test(c) || isSubstantialDoc(400)(c),
       }), emit);
-      if (v2.failed) {
-        yield* llmHalt(p, "nova", v2.failed);
+      if (novaTurn.failed) {
+        yield* llmHalt(p, "nova", novaTurn.failed);
         return;
       }
-      const art = await insertArtifact(p.id, "spec", `${ctx.product} — Product Spec v${v}`, v2.content, "nova", v, null, { generated: true });
-      yield { type: "artifact", artifact: art };
-      yield { type: "message", msg: await persistSpoken(p, "nova", "artifact", novaLine, { artifactId: art.id }) };
+      const revisedDoc = novaTurn.content.replace(/^\s*REVISED\s*/i, "").trim();
+      let specVersion = 1;
+      if (/^\s*STANDS:/im.test(novaTurn.content) || revisedDoc.length < 400) {
+        yield { type: "message", msg: await persistSpoken(p, "nova", "chat", { content: novaTurn.content.split("\n")[0]?.trim() || "Spec v1 stands — no material change from review." }) };
+      } else {
+        specVersion = 2;
+        const v = 2;
+        const art = await insertArtifact(p.id, "spec", `${ctx.product} — Product Spec v${v}`, revisedDoc, "nova", v, null, { generated: true });
+        yield { type: "artifact", artifact: art };
+        yield { type: "message", msg: await persistSpoken(p, "nova", "artifact", { content: `The concerns changed product requirements — spec v2 is on the table, revision limited to what review actually demanded.` }, { artifactId: art.id }) };
+      }
 
-      const ask = approvalAsk((await taskList(p.id)).length);
+      const ask = approvalAsk((await taskList(p.id)).length, specVersion);
       yield { type: "message", msg: await persistMsg(p.id, "atlas", "chat", ask) };
       await setStage(p.id, "awaiting_approval", false);
       yield { type: "stage", stage: "awaiting_approval" };
@@ -1104,9 +1206,11 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
       const review = await speak(spokenTurn(p, "sentinel", {
         instruction:
           `Review the workspace files below for ${ctx.product} — a real code review: concrete findings with file references and severity (P0–P3), or genuine approval if the work holds up.\n\n${filesDigest}\n\n` +
-          "End with EXACTLY one line:\nVERDICT: APPROVED\nor\nVERDICT: CHANGES: <comma-separated repo paths that need fixes>",
+          "End with EXACTLY one line:\nVERDICT: APPROVED\nor\nVERDICT: CHANGES: <comma-separated repo-relative file paths — bare paths only, no backticks, no annotations>",
         maxTokens: 2000,
         silent: true,
+        validate: isVerdictText,
+        retryReminder: "\n\nREMINDER: end with exactly one VERDICT line — APPROVED or CHANGES: <paths>.",
       }), emit);
       if (review.failed) {
         yield* llmHalt(p, "sentinel", review.failed);
@@ -1144,11 +1248,13 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
         return;
       }
 
-      // One fix round on the flagged files, then one re-read. Never more.
-      // Sentinel sometimes flags paths that are not workspace files (bare
-      // directories, hallucinated names) — drop those instead of burning the
-      // two-slot fix budget on dead lookups.
-      const flagged = (verdict?.changes ?? []).map((c) => c.replace(/\/+$/, ""));
+      // Auto-rework loop: each round Forge applies the latest findings to
+      // every flagged workspace file, then Sentinel re-reads the fixed files;
+      // a fresh CHANGES verdict feeds the next round. The operator is only
+      // pulled in after REVIEW_FIX_ROUNDS rounds, not between them. Sentinel
+      // sometimes flags paths that are not workspace files (bare directories,
+      // hallucinated names) — drop those instead of burning fix calls on dead
+      // lookups.
       const wsPaths = new Set(
         (
           await db
@@ -1157,42 +1263,39 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
             .where(and(eq(artifacts.projectId, p.id), eq(artifacts.type, "file")))
         ).map((r) => r.path ?? "")
       );
-      const valid = [...new Set(flagged)].filter((c) => c && wsPaths.has(c));
-      for (const dead of new Set(flagged.filter((f) => !f || !valid.includes(f)))) {
-        yield { type: "term", lines: [{ text: `skip ${dead || "(no path)"} — not a workspace file`, tone: "warn" }] };
-      }
-      if (!valid.length) {
-        yield {
-          type: "message",
-          msg: await persistMsg(
-            p.id,
-            "atlas",
-            "chat",
-            `**Sentinel requested changes, but none of the flagged paths exist in the workspace** (${flagged.join(", ") || "no paths given"}). The swarm has nothing it can fix — read the findings in the Review tab, reply *ship anyway* to ship over the objection, or send notes and the swarm will rework.`
-          ),
-        };
-        await setStage(p.id, "review", false);
-        return;
-      }
-      const fixable = valid.slice(0, 2);
-      const fixed: string[] = [];
-      for (const path of fixable) {
-        yield { type: "turn_start", agent: "forge" };
-        const fx = await fixTurn(p, path, review.content, emit);
-        if (fx.status === "halt") {
-          yield* llmHalt(p, "forge", fx.reason);
-          return;
+      let findings = review.content;
+      let current: ReviewVerdict | null = verdict;
+      let fixRounds = 0;
+      let sawTargets = false;
+      let anyFixed = false;
+      while (!current?.approved && fixRounds < REVIEW_FIX_ROUNDS) {
+        const flagged = (current?.changes ?? []).map((c) => c.replace(/\/+$/, ""));
+        const valid = [...new Set(flagged)].filter((c) => c && wsPaths.has(c));
+        for (const dead of new Set(flagged.filter((f) => !f || !valid.includes(f)))) {
+          yield { type: "term", lines: [{ text: `skip ${dead || "(no path)"} — not a workspace file`, tone: "warn" }] };
         }
-        if (fx.status === "unfixed") {
-          yield { type: "term", lines: [{ text: `✗ fix failed: ${path}`, tone: "err" }] };
-          continue;
+        if (!valid.length) break; // nothing actionable — escalate below
+        sawTargets = true;
+        fixRounds++;
+        const fixed: string[] = [];
+        for (const path of valid.slice(0, REVIEW_FIX_BATCH)) {
+          yield { type: "turn_start", agent: "forge" };
+          const fx = await fixTurn(p, path, findings, emit);
+          if (fx.status === "halt") {
+            yield* llmHalt(p, "forge", fx.reason);
+            return;
+          }
+          if (fx.status === "unfixed") {
+            yield { type: "term", lines: [{ text: `✗ fix failed: ${path}`, tone: "err" }] };
+            continue;
+          }
+          const wa = await writeFileArtifact(p, fx.file, { generated: true });
+          yield { type: "artifact", artifact: wa };
+          yield { type: "term", lines: [{ text: `write ${path} (v${wa.version}, review fix r${fixRounds})`, tone: "ok" }] };
+          fixed.push(path);
         }
-        const wa = await writeFileArtifact(p, fx.file, { generated: true });
-        yield { type: "artifact", artifact: wa };
-        yield { type: "term", lines: [{ text: `write ${path} (v${wa.version}, review fix)`, tone: "ok" }] };
-        fixed.push(path);
-      }
-      if (fixed.length) {
+        if (!fixed.length) break; // fixes not landing — operator decides
+        anyFixed = true;
         const fixNote = await speak(spokenTurn(p, "forge", {
           instruction: `You applied review fixes to ${fixed.map((f) => `\`${f}\``).join(", ")}. Report in 1-2 sentences. No code blocks.`,
           maxTokens: 600,
@@ -1200,9 +1303,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
         if (!fixNote.failed) {
           yield { type: "message", msg: await persistSpoken(p, "forge", "artifact", fixNote) };
         }
-      }
 
-      if (fixed.length) {
         const rows = await db
           .select({ path: artifacts.path, content: artifacts.content })
           .from(artifacts)
@@ -1223,20 +1324,44 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
         const re = await speak(spokenTurn(p, "sentinel", {
           instruction:
             `Re-read the fixed files below and judge only the fixes.\n\n${digest.join("\n")}\n\n` +
-            "End with EXACTLY one line:\nVERDICT: APPROVED\nor\nVERDICT: CHANGES: <paths>",
+            "End with EXACTLY one line:\nVERDICT: APPROVED\nor\nVERDICT: CHANGES: <comma-separated repo-relative file paths — bare paths only, no backticks, no annotations>",
           maxTokens: 1200,
           silent: true,
+          validate: isVerdictText,
+          retryReminder: "\n\nREMINDER: end with exactly one VERDICT line — APPROVED or CHANGES: <paths>.",
         }), emit);
         if (re.failed) {
           yield* llmHalt(p, "sentinel", re.failed);
           return;
         }
-        const v2 = parseVerdict(re.content);
-        if (v2?.approved) {
-          yield {
-            type: "message",
-            msg: await persistMsg(p.id, "sentinel", "chat", "Re-read complete — fixes hold. **APPROVED**. Probe, run verification.", { generated: true }),
-          };
+        findings = re.content;
+        current = parseVerdict(re.content);
+        const reArt = await insertArtifact(
+          p.id,
+          "review",
+          `Code review — ${ctx.product} (re-read ${fixRounds})`,
+          re.content,
+          "sentinel",
+          await nextVersion(p.id, "review"),
+          null,
+          { generated: true }
+        );
+        yield { type: "artifact", artifact: reArt };
+        yield {
+          type: "message",
+          msg: await persistMsg(
+            p.id,
+            "sentinel",
+            "chat",
+            current?.approved
+              ? "Re-read complete — fixes hold. **APPROVED**. Probe, run verification."
+              : current?.changes.length
+                ? `Round ${fixRounds}: fixes landed on ${fixed.length} file(s), still **changes requested** on ${current.changes.length} file(s). Forge, apply the findings.`
+                : `Round ${fixRounds}: fixes landed on ${fixed.length} file(s) — Sentinel still objects, but its verdict named no specific file to fix.`,
+            { artifactId: reArt.id, generated: true }
+          ),
+        };
+        if (current?.approved) {
           await setStage(p.id, "ship", true);
           yield { type: "stage", stage: "ship" };
           return;
@@ -1244,14 +1369,15 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
       }
 
       // Unresolved: the swarm does not self-certify — the operator decides.
+      const flaggedNow = current?.changes ?? [];
+      const parked = !sawTargets
+        ? `**Sentinel requested changes, but none of the flagged paths exist in the workspace** (${flaggedNow.join(", ") || "no paths given"}). The swarm has nothing it can fix — read the findings in the Review tab, reply *ship anyway* to ship over the objection, or send notes and the swarm will rework.`
+        : !anyFixed
+          ? `**Forge could not land any fixes** on the flagged files. Read the findings in the Review tab — reply *ship anyway* to ship over the objection, or send notes and the swarm will retry.`
+          : `**Sentinel did not approve after ${fixRounds} rework round${fixRounds === 1 ? "" : "s"}**${flaggedNow.length ? "" : " — its latest verdict names no specific file, likely a holistic concern"}. Read the findings in the Review tab — reply *ship anyway* to ship over the objection, or send notes and the swarm will rework.`;
       yield {
         type: "message",
-        msg: await persistMsg(
-          p.id,
-          "atlas",
-          "chat",
-          `**Sentinel did not approve.** Read the findings in the Review tab — reply *ship anyway* to ship over the objection, or send notes and the swarm will rework.`
-        ),
+        msg: await persistMsg(p.id, "atlas", "chat", parked),
       };
       await setStage(p.id, "review", false);
       return;
@@ -1266,9 +1392,10 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
       yield { type: "turn_start", agent: "probe" };
       const checklist = await speak(spokenTurn(p, "probe", {
         instruction:
-          `Produce the verification checklist for the shipped work as markdown. You performed STATIC review of the files only — the checklist must state clearly that nothing was executed. Group checks by capability with concrete file references.\n\n${await priorFilesDigest(p)}`,
+          `Produce the verification checklist for the shipped work as markdown, checked against the product spec below — flag any spec capability the workspace does not implement. You performed STATIC review of the files only — the checklist must state clearly that nothing was executed. Group checks by capability with concrete file references.\n\nProduct spec:\n${(await latestSpecOf(p.id)) ?? "(none)"}\n\n${await priorFilesDigest(p)}`,
         maxTokens: 2000,
         silent: true,
+        validate: isSubstantialDoc(),
       }), emit);
       if (checklist.failed) {
         yield* llmHalt(p, "probe", checklist.failed);
@@ -1335,6 +1462,7 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
           `Sections: **What shipped** (derived from the file list), **How it was verified** (state plainly: static review only, nothing executed), **Next moves** (2-3 concrete options).`,
         maxTokens: 2000,
         silent: true,
+        validate: isSubstantialDoc(),
       }), emit);
       if (report.failed) {
         yield* llmHalt(p, "atlas", report.failed);
@@ -1351,9 +1479,10 @@ async function* stepStage(p: ProjectRow, emit: (ev: SwarmEvent) => void): AsyncG
         { generated: true }
       );
       yield { type: "artifact", artifact: sArt };
+      const shippedOverObjection = Boolean((p.ctx as { shippedOverObjection?: boolean } | null)?.shippedOverObjection);
       yield {
         type: "message",
-        msg: await persistMsg(p.id, "atlas", "artifact", `🚀 **${ctx.product} is shipped.** Spec honored, review clean, QA passed. Harness pack is in Files so the next agent — any of them — can continue. It's been a pleasure building with you, Commander.`, { artifactId: sArt.id }),
+        msg: await persistMsg(p.id, "atlas", "artifact", `🚀 **${ctx.product} is shipped.** ${shippedOverObjection ? "Shipped **over Sentinel's unresolved objection** on your call — read the Review tab before building on this." : "Sentinel approved; QA checklist published."} Harness pack is in Files so the next agent — any of them — can continue. It's been a pleasure building with you, Commander.`, { artifactId: sArt.id }),
       };
       yield {
         type: "term",

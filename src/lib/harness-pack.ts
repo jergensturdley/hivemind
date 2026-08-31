@@ -1,4 +1,5 @@
 import { HARNESSES } from "@/lib/harnesses";
+import { PONYTAIL_FULL, UNLAZY_TREE } from "@/lib/agents";
 import type { SwarmCtx } from "@/lib/spec";
 
 export type HarnessFile = {
@@ -19,7 +20,9 @@ const CONVENTIONS_SECTION = `## Conventions
 - Honor the architecture artifact before adding files.
 - Don't invent scope the spec didn't ask for.
 - Keep types strict; validate mutations server-side.
-- Never commit secrets or BYOK keys.`;
+- Never commit secrets or BYOK keys.
+- ${PONYTAIL_FULL}
+- ${UNLAZY_TREE}`;
 
 function coreBody(ctx: SwarmCtx): string {
   const caps = ctx.features

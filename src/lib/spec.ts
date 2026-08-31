@@ -113,8 +113,8 @@ export function parseSpec(spec: string, fallbackName: string): SwarmCtx {
   return { product, slug: slugify(product), tagline, features, stack, domain };
 }
 
-export function approvalAsk(tasks: number): string {
-  return `Plan is stable after critique: **${tasks} tasks**, spec v2, architecture locked. Commander — approve the build and Forge starts immediately, or reply with changes.`;
+export function approvalAsk(tasks: number, specVersion: number): string {
+  return `Plan is stable after critique: **${tasks} tasks**, spec v${specVersion}, architecture locked. Commander — approve the build and Forge starts immediately, or reply with changes.`;
 }
 
 /** Which agent answers an @-mention (or any interrupt). */

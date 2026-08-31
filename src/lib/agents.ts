@@ -81,6 +81,20 @@ export const AGENTS: AgentDef[] = [
   },
 ];
 
+/**
+ * Distilled working discipline appended to every agent turn and the shipped
+ * harness pack: ponytail at full intensity (efficiency ladder) plus unlazy
+ * with a bounded tree (prove outcomes, cap decomposition). Deliberately
+ * short — it rides along on every LLM turn, so tokens spent here repeat.
+ */
+export const PONYTAIL_FULL =
+  "Working discipline (ponytail, full): before writing anything, stop at the first rung that holds — skip speculative work; reuse what already exists in this codebase; stdlib and platform features before new code or new dependencies; smallest correct diff that fixes the root cause, not the symptom. No unrequested abstractions, no scaffolding for later, boring over clever. Non-trivial logic leaves one runnable check behind.";
+
+export const UNLAZY_TREE =
+  "Working discipline (unlazy, solo-first): state the observable done-criteria for the task before doing it — one per required outcome. Split work only when outcomes are independently required, and cap the tree: at most 2 levels and 6 leaves. Report done only when every criterion is verifiably met; if one is not, name it and what is missing — never silently drop or claim unverified work. Re-measure any number before reporting it.";
+
+export const AGENT_DISCIPLINE = `${PONYTAIL_FULL} ${UNLAZY_TREE}`;
+
 export const agentById = (id: string): AgentDef | undefined =>
   AGENTS.find((a) => a.id === id);
 

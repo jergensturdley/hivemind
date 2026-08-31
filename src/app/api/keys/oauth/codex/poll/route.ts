@@ -24,7 +24,12 @@ export async function POST(req: Request) {
 
   await forgetDevice("codex", user.id);
 
-  await db.update(apiKeys).set({ isDefault: false }).where(eq(apiKeys.userId, user.id));
+  // The default key is a user choice (Settings "Use as default"); a new key
+  // only claims it when it is the account's first.
+  const isFirst = !((await db.select({ id: apiKeys.id }).from(apiKeys).where(eq(apiKeys.userId, user.id))).length);
+  if (isFirst) {
+    await db.update(apiKeys).set({ isDefault: false }).where(eq(apiKeys.userId, user.id));
+  }
   const [row] = await db
     .insert(apiKeys)
     .values({
@@ -39,7 +44,7 @@ export async function POST(req: Request) {
       tokenExpiresAt: result.tokens.expires_in
         ? new Date(Date.now() + result.tokens.expires_in * 1000)
         : null,
-      isDefault: true,
+      isDefault: isFirst,
     })
     .returning();
 

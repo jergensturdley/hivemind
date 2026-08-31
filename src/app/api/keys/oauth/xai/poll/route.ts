@@ -26,7 +26,12 @@ export async function POST(req: Request) {
     ? new Date(Date.now() + result.tokens.expires_in * 1000)
     : new Date(Date.now() + 3600_000);
 
-  await db.update(apiKeys).set({ isDefault: false }).where(eq(apiKeys.userId, user.id));
+  // The default key is a user choice (Settings "Use as default"); a new key
+  // only claims it when it is the account's first.
+  const isFirst = !((await db.select({ id: apiKeys.id }).from(apiKeys).where(eq(apiKeys.userId, user.id))).length);
+  if (isFirst) {
+    await db.update(apiKeys).set({ isDefault: false }).where(eq(apiKeys.userId, user.id));
+  }
   const [row] = await db
     .insert(apiKeys)
     .values({
@@ -39,7 +44,7 @@ export async function POST(req: Request) {
       authKind: "oauth",
       refreshToken: result.tokens.refresh_token ?? null,
       tokenExpiresAt: expires,
-      isDefault: true,
+      isDefault: isFirst,
     })
     .returning();
 

@@ -288,7 +288,7 @@ export function SettingsClient({ user }: { user: { id: number; name: string; ema
       const res = await fetch("/api/keys", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ provider, label, baseUrl, secret, isDefault: true }),
+        body: JSON.stringify({ provider, label, baseUrl, secret }),
       });
       const data = (await res.json()) as { id?: number; error?: string };
       if (!res.ok || !data.id) {
@@ -462,6 +462,19 @@ export function SettingsClient({ user }: { user: { id: number; name: string; ema
                             className={cls.btn}
                           >
                             Use {cat.recommended}
+                          </button>
+                        )}
+                        {!k.isDefault && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void patchKey(k.id, { isDefault: true }).then(() => flash(`${k.label} is default — Atlas routes the swarm here`));
+                            }}
+                            disabled={!k.model.trim()}
+                            title={k.model.trim() ? "Atlas and every un-routed agent speak through this key" : "Pick a model first — the swarm cannot run without one"}
+                            className={cls.btn}
+                          >
+                            ★ Use as default
                           </button>
                         )}
                         <button

@@ -1,11 +1,17 @@
 # Hivemind web — built for Apple's `container` runtime (linux/arm64).
 FROM node:22-bookworm-slim AS deps
 WORKDIR /app
+# WARP RSTs container NAT egress; builds fetch through the host proxy when
+# app-up.sh passes it (registry, next/font/google). Scoped to build stages.
+ARG HTTPS_PROXY
+ENV HTTPS_PROXY=${HTTPS_PROXY}
 COPY package.json package-lock.json ./
 RUN npm ci
 
 FROM node:22-bookworm-slim AS builder
 WORKDIR /app
+ARG HTTPS_PROXY
+ENV HTTPS_PROXY=${HTTPS_PROXY}
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 # Pool is created at import time; a reachable DB is not required during `next build`.

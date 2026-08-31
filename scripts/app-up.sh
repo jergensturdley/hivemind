@@ -36,14 +36,40 @@ else
   echo "App will reach Postgres at ${pg_ip}:5432 (gateway not detected)"
 fi
 
+# Outbound LLM traffic goes through the host-side CONNECT proxy
+# (scripts/egress-proxy.mjs, LaunchAgent com.hivemind.egress-proxy): WARP
+# TunnelOnly RSTs container NAT egress, but host-originated flows pass.
+proxy_env=()
+proxy_build_args=()
+if [[ -n "$gateway_ip" ]] && nc -z "$gateway_ip" 8118 2>/dev/null; then
+  proxy_env=(-e "HIVEMIND_EGRESS_PROXY=http://${gateway_ip}:8118")
+  proxy_build_args=(--build-arg "HTTPS_PROXY=http://${gateway_ip}:8118")
+  echo "App will egress via host proxy ${gateway_ip}:8118"
+else
+  echo "Egress proxy not reachable on ${gateway_ip:-?}:8118 — direct egress (needs WARP off)"
+fi
+
 if ! container builder status 2>/dev/null | grep -qi running; then
   echo "Starting Apple container builder…"
   container builder start -c 4 -m 8G
 fi
 
+# Harness detection: resolve coding-agent CLIs on the operator's machine now
+# and hand the results to the app — the container's own PATH can't see host
+# installs, and host bins are often symlinks into version dirs that don't
+# survive a read-only mount.
+HOST_HARNESSES_ENV=""
+for b in claude codex grok cursor-agent cursor aider gemini opencode; do
+  p="$(command -v "$b" 2>/dev/null || true)"
+  [[ -z "$p" ]] && continue
+  [[ -n "$HOST_HARNESSES_ENV" ]] && HOST_HARNESSES_ENV="${HOST_HARNESSES_ENV},"
+  HOST_HARNESSES_ENV="${HOST_HARNESSES_ENV}${b}:${p}"
+done
+echo "Harnesses resolved on host: ${HOST_HARNESSES_ENV:-none}"
+
 if [[ "${SKIP_BUILD:-}" != "1" ]]; then
   echo "Building ${IMAGE}…"
-  container build -t "$IMAGE" -c 4 -m 8G .
+  container build -t "$IMAGE" -c 4 -m 8G ${proxy_build_args[@]+"${proxy_build_args[@]}"} .
 fi
 
 state="$(container inspect "$NAME" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[0]["status"] if d else "")' 2>/dev/null || true)"
@@ -61,6 +87,8 @@ container run -d \
   --network default \
   -e "DATABASE_URL=${database_url}" \
   -e "SESSION_SECRET=${SESSION_SECRET}" \
+  -e "HIVEMIND_HOST_HARNESSES=${HOST_HARNESSES_ENV}" \
+  ${proxy_env[@]+"${proxy_env[@]}"} \
   -e NODE_ENV=production \
   -e HOSTNAME=0.0.0.0 \
   -e PORT=3000 \

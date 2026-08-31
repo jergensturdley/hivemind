@@ -35,7 +35,7 @@ Six specialists, each addressable by `@mention` mid-run, each routable to its ow
 intake → spec → plan → critique → [your approval] → build → review → ship → done
 ```
 
-Atlas receives the brief on intake and assembles the swarm. Nova writes the v1 spec; Vector drafts the architecture and pulls the task list out of the model. Critique is where it gets interesting: Sentinel raises design concerns, Vector absorbs them, Nova publishes spec v2 — and then everything stops. Nothing builds until you approve, or revise with notes.
+Atlas receives the brief on intake and assembles the swarm. Nova writes the v1 spec; Vector drafts the architecture and pulls the task list out of the model. Critique is where it gets interesting: Sentinel raises design concerns, Vector absorbs them, Nova either holds the spec at v1 or publishes a v2 — and then everything stops. Nothing builds until you approve, or revise with notes.
 
 Build runs task by task under Forge, each one showing live in the activity strip and on the task board. Harness-routed tasks print the host command and land back in the workbench. Once the code's in, Sentinel reviews the workspace; changes trigger one fix round and one re-read — not an endless loop. An objection that survives parks the mission for you. Reply **ship anyway** to override, or send notes and it reworks.
 

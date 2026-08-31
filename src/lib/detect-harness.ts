@@ -5,6 +5,20 @@ import { HARNESSES, type HarnessDef } from "@/lib/harnesses";
 const execFileP = promisify(execFile);
 const BIN_RE = /^[a-z0-9][a-z0-9._-]*$/i;
 
+// Harness CLIs resolved on the operator's machine by scripts/app-up.sh and
+// passed in as "bin:path,bin:path" — the app container's own PATH knows
+// nothing about host installs (which are often symlinks into version dirs),
+// so probes must be host-side.
+const HOST_HARNESSES = new Map(
+  (process.env.HIVEMIND_HOST_HARNESSES ?? "")
+    .split(",")
+    .filter(Boolean)
+    .map((entry) => {
+      const [bin, ...path] = entry.split(":");
+      return [bin, path.join(":")] as const;
+    })
+);
+
 export type HarnessStatus = HarnessDef & {
   installed: boolean;
   binPath: string | null;
@@ -15,10 +29,11 @@ async function whichOne(bin: string): Promise<string | null> {
   try {
     const { stdout } = await execFileP("which", [bin], { timeout: 800 });
     const line = stdout.trim().split("\n")[0]?.trim();
-    return line || null;
+    if (line) return line;
   } catch {
-    return null;
+    /* not on this PATH */
   }
+  return HOST_HARNESSES.get(bin) ?? null;
 }
 
 export async function detectHarness(h: HarnessDef): Promise<Pick<HarnessStatus, "installed" | "binPath">> {
